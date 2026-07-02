@@ -1,5 +1,5 @@
 {
-  "subtitle": "Sideloading Companion",
+  "subtitle": "Install Wander on your iPhone",
   "version": "Version",
   "common": {
     "confirm": "Confirm",
@@ -33,8 +33,9 @@
     "devices": "Devices",
     "active_device": "Active: {{name}}",
     "select_device": "Select a device",
-    "installers": "Installers",
-    "choose_build": "Choose a build",
+    "installers": "Install",
+    "choose_build": "One tap to put Wander on your iPhone.",
+    "install_wander": "Install Wander",
     "sidestore_stable": "SideStore (Stable)",
     "sidestore_nightly": "SideStore (Nightly)",
     "livecontainer_sidestore_stable": "LiveContainer + SideStore (Stable)",
@@ -44,7 +45,7 @@
     "must_be_logged_in": "You must be logged in!",
     "must_select_device": "You must select a device!",
     "ipa_files": "IPA Files",
-    "logo_alt": "iloader logo"
+    "logo_alt": "Wander Installer logo"
   },
   "apple_id": {
     "title": "Apple ID",
@@ -115,7 +116,13 @@
     "install_livecontainer_step_install": "Sign & Install LiveContainer+SideStore",
     "install_livecontainer_step_pairing": "Place Pairing File",
     "sideload_title": "Installing App",
-    "sideload_step_install": "Sign & Install App"
+    "sideload_step_install": "Sign & Install App",
+    "install_wander_title": "Installing Wander",
+    "install_wander_success_title": "Wander Installed!",
+    "install_wander_success_message": "Turn on Developer Mode (Settings → Privacy & Security → Developer Mode), open LocalDevVPN, then open Wander.",
+    "install_wander_step_download": "Download Wander",
+    "install_wander_step_install": "Sign & Install Wander",
+    "install_wander_step_pairing": "Place Pairing File"
   },
   "certificates": {
     "manage": "Manage Certificates",

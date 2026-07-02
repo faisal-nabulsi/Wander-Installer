@@ -9,6 +9,7 @@ import {
   sideloadOperation,
   installSideStoreOperation,
   installLiveContainerOperation,
+  wanderInstallOperation,
   Operation,
   OperationState,
   OperationUpdate,
@@ -23,10 +24,14 @@ import { Settings } from "./pages/Settings";
 import { Pairing } from "./pages/Pairing";
 import { getVersion } from "@tauri-apps/api/app";
 import { checkForUpdates } from "./update";
-import logo from "./iloader.svg";
+import logo from "./wander.svg";
 import { GlassCard } from "./components/GlassCard";
 import { useTranslation } from "react-i18next";
 import { usePlatform } from "./PlatformContext";
+
+// When true, hide everything except signing in, selecting a device, and the single
+// "Install Wander" button. The full iloader UI is kept behind this flag.
+const MINIMAL = true;
 
 function App() {
   const { t } = useTranslation();
@@ -185,7 +190,7 @@ function App() {
           <div className="title-block">
             <img src={logo} alt={t("app.logo_alt")} className="logo" />
             <div>
-              <h1 className="title">iloader</h1>
+              <h1 className="title">Wander Installer</h1>
               <p className="subtitle">{t("subtitle")}</p>
             </div>
           </div>
@@ -227,6 +232,7 @@ function App() {
               />
             </GlassCard>
           </section>
+          {!MINIMAL && (
           <section className="workspace-section">
             <p className="section-label">{t("app.section_management")}</p>
             <div className="workspace-list">
@@ -275,6 +281,7 @@ function App() {
               </button>
             </div>
           </section>
+          )}
         </aside>
         <section className="workspace-content">
           <section className="workspace-section">
@@ -305,6 +312,19 @@ function App() {
             </div>
             <GlassCard className="panel">
               <div className="action-row single-row">
+                <button
+                  onClick={() => {
+                    if (!ensuredLoggedIn() || !ensureSelectedDevice()) return;
+                    startOperation(wanderInstallOperation, {}).catch((e) => {
+                      console.log(e?.type);
+                      console.error(e?.message);
+                    });
+                  }}
+                >
+                  {t("app.install_wander")}
+                </button>
+                {!MINIMAL && (
+                  <>
                 <button
                   onClick={() => {
                     if (!ensuredLoggedIn() || !ensureSelectedDevice()) return;
@@ -381,9 +401,12 @@ function App() {
                 >
                   {t("app.import_ipa")}
                 </button>
+                  </>
+                )}
               </div>
             </GlassCard>
           </section>
+          {!MINIMAL && (
           <section className="workspace-section">
             <p className="section-label">{t("app.settings")}</p>
             <GlassCard className="panel settings-panel">
@@ -396,6 +419,7 @@ function App() {
               />
             </GlassCard>
           </section>
+          )}
           {operationState && (
             <OperationView
               operationState={operationState}

@@ -25,7 +25,9 @@ use crate::{
         place_pairing_cmd,
     },
     secure_storage::{force_disable_keyring, keyring_available},
-    sideload::{SideloaderMutex, install_sidestore_operation, sideload_operation},
+    sideload::{
+        SideloaderMutex, install_sidestore_operation, install_wander_operation, sideload_operation,
+    },
 };
 use tauri::Manager;
 use tracing_subscriber::{Layer, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -49,7 +51,7 @@ pub fn run() {
 
             let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
                 .rotation(tracing_appender::rolling::Rotation::DAILY)
-                .filename_prefix("iloader")
+                .filename_prefix("wander-installer")
                 .filename_suffix("log")
                 .max_log_files(2)
                 .build(&log_dir)
@@ -113,6 +115,7 @@ pub fn run() {
             sideload_operation,
             set_selected_device,
             install_sidestore_operation,
+            install_wander_operation,
             get_certificates,
             revoke_certificate,
             list_app_ids,

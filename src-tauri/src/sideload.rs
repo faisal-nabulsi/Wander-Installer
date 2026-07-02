@@ -4,7 +4,7 @@ use crate::{
     device::{DeviceInfoMutex, get_provider, get_provider_from_connection, get_usbmuxd},
     error::AppError,
     operation::Operation,
-    pairing::{get_sidestore_info, place_file},
+    pairing::{get_sidestore_info, get_wander_info, place_file},
 };
 use isideload::sideload::{application::SpecialApp, sideloader::Sideloader};
 use tauri::{AppHandle, Manager, State, Window};
@@ -164,6 +164,69 @@ pub async fn install_sidestore_operation(
             AppError::HouseArrest(
                 "SideStore's not found".into(),
                 "The device did not report SideStore's bundle ID as installed".into(),
+            ),
+        );
+    }
+
+    op.complete("pairing")?;
+    Ok(())
+}
+
+/// Downloads the latest Wander.ipa, signs & installs it, then places the pairing
+/// file — the single action Wander Installer exposes.
+#[tauri::command]
+pub async fn install_wander_operation(
+    handle: AppHandle,
+    window: Window,
+    device_state: State<'_, DeviceInfoMutex>,
+    sideloader_state: State<'_, SideloaderMutex>,
+) -> Result<(), AppError> {
+    let op = Operation::new("install_wander".to_string(), &window);
+    op.start("download")?;
+    let url = "https://github.com/faisal-nabulsi/Wander/releases/latest/download/Wander.ipa";
+    let dest = handle
+        .path()
+        .temp_dir()
+        .map_err(|e| AppError::Filesystem("Failed to get temp dir".into(), e.to_string()))?
+        .join("Wander.ipa");
+    op.fail_if_err("download", download(url, &dest).await)?;
+    op.move_on("download", "install")?;
+    let device = {
+        let device_guard = device_state.lock().unwrap();
+        match &*device_guard {
+            Some(d) => d.clone(),
+            None => return op.fail("install", AppError::NoDeviceSelected),
+        }
+    };
+    op.fail_if_err(
+        "install",
+        sideload(
+            device_state,
+            sideloader_state,
+            dest.to_string_lossy().to_string(),
+        )
+        .await,
+    )?;
+    op.move_on("install", "pairing")?;
+    let wander_info = op.fail_if_err("pairing", get_wander_info(&device.info).await)?;
+    if let Some(info) = wander_info {
+        let mut usbmuxd = op.fail_if_err("pairing", get_usbmuxd().await)?;
+
+        let provider = op.fail_if_err(
+            "pairing",
+            get_provider_from_connection(&device.info, &mut usbmuxd).await,
+        )?;
+
+        op.fail_if_err(
+            "pairing",
+            place_file(device.pairing, &provider, info.bundle_id, info.path).await,
+        )?;
+    } else {
+        return op.fail(
+            "pairing",
+            AppError::HouseArrest(
+                "Wander not found".into(),
+                "The device did not report Wander's bundle ID as installed".into(),
             ),
         );
     }

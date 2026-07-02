@@ -108,7 +108,7 @@ async fn generate_lockdown_plist(
 async fn generate_rppairing_plist(
     provider: &dyn IdeviceProvider,
 ) -> Result<(plist::Value, Vec<u8>), IdeviceError> {
-    let bytes = generate_rppairing(provider, "iloader").await?.to_bytes();
+    let bytes = generate_rppairing(provider, "wander-installer").await?.to_bytes();
     let plist = plist::Value::from_reader_xml(std::io::Cursor::new(&bytes))
         .map_err(|e| IdeviceError::InternalError(format!("Invalid RPPairing plist: {}", e)))?;
     Ok((plist, bytes))
@@ -534,6 +534,45 @@ pub async fn get_sidestore_info(
                     .find(|(name, _)| name == &n)
                     .map(|(_, path)| path.to_string())
                     .unwrap_or_default(),
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Finds Wander (a StikDebug-family app, bundle id contains "com.stik.stikdebug")
+/// among installed apps, so its pairing file can be placed after install.
+pub async fn get_wander_info(device: &DeviceInfo) -> Result<Option<PairingAppInfo>, AppError> {
+    let provider = get_provider(device).await?;
+    let mut installation_proxy =
+        InstallationProxyClient::connect(&provider)
+            .await
+            .map_err(|e| {
+                AppError::DeviceComsWithMessage(
+                    "Failed to connect to installation proxy".into(),
+                    e.to_string(),
+                )
+            })?;
+
+    let installed_apps = installation_proxy
+        .get_apps(Some("User"), None)
+        .await
+        .map_err(|e| {
+            AppError::DeviceComsWithMessage("Failed to get installed apps".into(), e.to_string())
+        })?;
+
+    for (bundle_id, app) in installed_apps {
+        let display_name = app
+            .as_dictionary()
+            .and_then(|x| x.get("CFBundleDisplayName").and_then(|x| x.as_string()))
+            .unwrap_or("");
+
+        if display_name == "Wander" || bundle_id.contains("com.stik.stikdebug") {
+            return Ok(Some(PairingAppInfo {
+                name: "Wander".to_string(),
+                bundle_id: bundle_id.to_string(),
+                path: "rp_pairing_file.plist".to_string(),
             }));
         }
     }

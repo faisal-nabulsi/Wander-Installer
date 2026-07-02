@@ -88,3 +88,24 @@ export const sideloadOperation = {
     },
   ],
 };
+
+export const wanderInstallOperation: Operation = {
+  id: "install_wander",
+  titleKey: "operations.install_wander_title",
+  successTitleKey: "operations.install_wander_success_title",
+  successMessageKey: "operations.install_wander_success_message",
+  steps: [
+    {
+      id: "download",
+      titleKey: "operations.install_wander_step_download",
+    },
+    {
+      id: "install",
+      titleKey: "operations.install_wander_step_install",
+    },
+    {
+      id: "pairing",
+      titleKey: "operations.install_wander_step_pairing",
+    },
+  ],
+};
