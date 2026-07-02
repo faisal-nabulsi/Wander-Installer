@@ -14,16 +14,19 @@ Wander Installer sets up a tiny OS scheduled job — **launchd** on macOS, **Tas
 - ❌ The **computer** has to be on and the phone reachable within each 7-day window. (This is how AltServer works.)
 - **Effort:** medium. Reuse the existing `sideload()` path with `resign_immediately = true`; add an agent installer + a headless "refresh" entrypoint.
 
-## Option 3 — Bundle SideStore for on-device refresh (best for untethered)
-In the same one-click flow, Wander Installer installs **both Wander and a minimal SideStore**, and hands SideStore the pairing file. SideStore then refreshes Wander **on the phone, with no computer**, forever (this is the AltStore model — the installer bootstraps an on-device refresher). iloader already knows how to install SideStore, so most of this exists.
-- ✅ Truly untethered — after the first setup, **no computer ever again**.
-- ✅ Still one click for the user.
-- ❌ SideStore lives on the phone (runs invisibly; the user doesn't have to touch it).
-- **Effort:** medium. Chain `install_sidestore_operation` + `install_wander_operation`, place pairing into both, and (optionally) pre-select Wander in SideStore's auto-refresh list.
+## Option 3 — Install via SideStore for on-device refresh (untethered)
+**Important correction:** SideStore only auto-refreshes apps **it installed itself**. It will *not* refresh a copy of Wander that Wander Installer sideloaded directly. So for untethered refresh, Wander has to be **installed through SideStore**:
+1. Wander Installer installs **SideStore** (one click) and places the pairing file into it — iloader already does exactly this.
+2. Then Wander is installed **from inside SideStore** using our source (`.../apps.json`). SideStore now manages Wander and refreshes it **on the phone, no computer**, forever.
+
+- ✅ Truly untethered — after first setup, **no computer ever again**.
+- ⚠️ Trade-off: this is **not** the one-click *direct* install — Wander comes from SideStore (an extra "open SideStore → install Wander" step), and SideStore lives on the phone.
+- **Effort:** low — reuses `install_sidestore_operation` + our existing SideStore source.
 
 ## Recommendation
-- Ship **Option 1** now (done).
-- Build **Option 3** next for the "no computer after setup" experience you want — it reuses code iloader already has and gives untethered refresh, which Option 2 can't.
-- Keep **Option 2** as a "no second app on my phone" alternative for power users.
+There's an unavoidable fork here: **one-click direct install** (what ships now) and **untethered no-computer refresh** can't both be true — untethered refresh needs an on-device re-signer (a SideStore-like app), which means Wander has to be a *SideStore-managed* app.
+
+- **If minimal one-click matters most:** keep the direct install (done) + a weekly re-run, or add **Option 2** (silent background re-sign agent — automatic, but needs the computer on).
+- **If no-computer-ever matters most:** go **Option 3** — Wander Installer sets SideStore up, and Wander installs/refreshes through it.
 
 None of these remove the **one-time** computer bootstrap (Apple requires a computer to first sign an app onto a non-jailbroken iPhone) or the **Developer Mode** toggle (Apple requires the user to enable it by hand). Those are Apple-imposed and unavoidable for every tool, including the paid ones.

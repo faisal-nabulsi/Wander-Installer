@@ -1,4 +1,4 @@
-name: "Build iloader"
+name: "Build Wander Installer"
 
 on:
   push:
@@ -51,9 +51,9 @@ jobs:
             ~/.cargo/git
             src-tauri/target
             node_modules
-          key: ${{ matrix.platform }}-iloader-${{ hashFiles('**/Cargo.lock', 'package-lock.json') }}
+          key: ${{ matrix.platform }}-wander-installer-${{ hashFiles('**/Cargo.lock', 'package-lock.json') }}
           restore-keys: |
-            ${{ runner.os }}-iloader-
+            ${{ runner.os }}-wander-installer-
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
