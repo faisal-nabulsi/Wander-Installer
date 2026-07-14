@@ -8,7 +8,12 @@ use tracing::warn;
 
 use crate::error::AppError;
 
-static FORCE_DISABLE_KEYRING: AtomicBool = AtomicBool::new(false);
+// Default to filesystem storage instead of the macOS login keychain. Wander Installer
+// ships UNSIGNED (no paid Apple Developer cert), and macOS re-prompts for the login
+// keychain password on every access by an unsigned app — spamming users during login.
+// Storing sideloading data (Apple ID session / anisette / pairing) in a file in the app's
+// data dir avoids the keychain entirely, so there are no repeated password prompts.
+static FORCE_DISABLE_KEYRING: AtomicBool = AtomicBool::new(true);
 
 #[tauri::command]
 pub fn force_disable_keyring(force: bool) {
