@@ -44,7 +44,7 @@
     "must_be_logged_in": "ログインが必要です！",
     "must_select_device": "デバイスを選択してください！",
     "ipa_files": "IPAファイル",
-    "logo_alt": "iloader ロゴ"
+    "logo_alt": "Wander ロゴ"
   },
   "apple_id": {
     "title": "Apple ID",
@@ -75,7 +75,7 @@
     "valid_6digit": "有効な6桁のコードを入力してください。",
     "submit": "送信",
     "max_certs_title": "証明書の上限に達しました",
-    "max_certs_desc": "iloaderは既存の証明書を無効化（Revoke）し、新しいものを生成します。",
+    "max_certs_desc": "Wanderは既存の証明書を無効化（Revoke）し、新しいものを生成します。",
     "hide_certificate_list": "証明書リストを隠す",
     "choose_what_to_revoke": "無効化するものを選択",
     "continue": "続行"

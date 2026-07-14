@@ -203,7 +203,7 @@ function App() {
             className="toolbar-button"
             onClick={async () => {
               try {
-                await openUrl("https://github.com/nab138/iloader");
+                await openUrl("https://github.com/faisal-nabulsi/Wander-Installer");
               } catch (error) {
                 console.error("Failed to open GitHub link", error);
                 toast.error(t("app.open_github_failed"));

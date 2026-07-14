@@ -211,7 +211,7 @@ export default ({
                   github: (
                     <span
                       onClick={() =>
-                        openUrl("https://github.com/nab138/iloader/issues")
+                        openUrl("https://github.com/faisal-nabulsi/Wander-Installer/issues")
                       }
                       role="link"
                       className="error-link"

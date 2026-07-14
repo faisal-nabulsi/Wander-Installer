@@ -139,7 +139,7 @@ export const Settings = ({
                   <span
                     onClick={() =>
                       openUrl(
-                        "https://github.com/nab138/iloader?tab=readme-ov-file#translating",
+                        "https://github.com/faisal-nabulsi/Wander-Installer?tab=readme-ov-file#translating",
                       )
                     }
                     role="link"
