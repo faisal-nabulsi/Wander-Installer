@@ -313,6 +313,7 @@ function App() {
             <GlassCard className="panel">
               <div className="action-row single-row">
                 <button
+                  className="primary"
                   onClick={() => {
                     if (!ensuredLoggedIn() || !ensureSelectedDevice()) return;
                     startOperation(wanderInstallOperation, {}).catch((e) => {
