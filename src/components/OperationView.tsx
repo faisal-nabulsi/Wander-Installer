@@ -33,7 +33,7 @@ export default ({
   const [moreDetailsOpen, setMoreDetailsOpen] = useState(false);
   const [anisetteServer] = useStore<string>(
     "anisetteServer",
-    "ani.sidestore.io",
+    "ani.846969.xyz",
   );
   const { platform } = usePlatform();
   const [suggestions, setSuggestions] = useState<string[]>([]);

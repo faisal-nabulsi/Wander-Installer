@@ -122,6 +122,9 @@
 .operation-success-message {
   font-weight: 600;
   color: rgb(241, 212, 115);
+  white-space: pre-line;   /* render the numbered post-install steps on their own lines */
+  line-height: 1.5;
+  text-align: left;
 }
 
 .operation-more-details {

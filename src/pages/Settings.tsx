@@ -42,7 +42,7 @@ export const Settings = ({
   const { t } = useTranslation();
   const [anisetteServer, setAnisetteServer] = useStore<string>(
     "anisetteServer",
-    "ani.sidestore.io",
+    "ani.846969.xyz",
   );
 
   const [overrideKeyring, setOverrideKeyring] = useStore<boolean>(

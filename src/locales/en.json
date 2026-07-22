@@ -119,7 +119,7 @@
     "sideload_step_install": "Sign & Install App",
     "install_wander_title": "Installing Wander",
     "install_wander_success_title": "Wander Installed!",
-    "install_wander_success_message": "Turn on Developer Mode (Settings → Privacy & Security → Developer Mode), open LocalDevVPN, then open Wander.",
+    "install_wander_success_message": "Finish on your iPhone:\n1. Trust the developer: Settings → General → VPN & Device Management → tap your Apple ID → Trust.\n2. Turn on Developer Mode: Settings → Privacy & Security → Developer Mode, then restart.\n3. Open LocalDevVPN, then open Wander.",
     "install_wander_step_download": "Download Wander",
     "install_wander_step_install": "Sign & Install Wander",
     "install_wander_step_pairing": "Place Pairing File"
