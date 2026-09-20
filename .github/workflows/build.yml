@@ -8,6 +8,11 @@ on:
     branches:
       - "*"
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Build a real release into this existing tag (e.g. v2.3.1). Leave empty for a plain CI build. Needed because this repo is a fork, and GitHub does not fire push/release events on forks -- only this manual dispatch."
+        required: false
+        default: ""
   release:
     types: [published]
 
@@ -94,12 +99,22 @@ jobs:
           bunx rimraf src-tauri/target/universal-apple-darwin/release/bundle
 
       - name: Export Apple signing secrets (release only)
-        if: matrix.platform == 'macos-latest' && env.HAVE_SIGNING_SECRETS == 'true' && github.event_name == 'release'
+        if: matrix.platform == 'macos-latest' && env.HAVE_SIGNING_SECRETS == 'true' && (github.event_name == 'release' || inputs.release_tag != '')
         run: |
           echo "APPLE_CERTIFICATE=${{ secrets.DEV_ID_P12_BASE64 }}" >> $GITHUB_ENV
           echo "APPLE_CERTIFICATE_PASSWORD=${{ secrets.DEV_ID_P12_PASSWORD }}" >> $GITHUB_ENV
           echo "APPLE_SIGNING_IDENTITY=${{ secrets.DEV_IDENTITY_NAME }}" >> $GITHUB_ENV
           echo "APPLE_TEAM_ID=${{ secrets.NOTARIZE_TEAM_ID }}" >> $GITHUB_ENV
+
+      - name: Resolve target release (manual release build)
+        if: inputs.release_tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ID=$(gh api "repos/${{ github.repository }}/releases/tags/${{ inputs.release_tag }}" --jq .id)
+          echo "Resolved ${{ inputs.release_tag }} -> release id $ID"
+          echo "TARGET_RELEASE_ID=$ID" >> "$GITHUB_ENV"
 
       - name: Build
         uses: tauri-apps/tauri-action@v0
@@ -108,13 +123,13 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          args: ${{ matrix.args }} ${{ github.event_name != 'release' && ' --config src-tauri/ci.conf.json' || '' }}
-          includeUpdaterJson: ${{ github.event_name == 'release' }}
-          releaseId: ${{ github.event_name == 'release' && github.event.release.id || '' }}
+          args: ${{ matrix.args }} ${{ (github.event_name != 'release' && inputs.release_tag == '') && ' --config src-tauri/ci.conf.json' || '' }}
+          includeUpdaterJson: ${{ github.event_name == 'release' || inputs.release_tag != '' }}
+          releaseId: ${{ github.event_name == 'release' && github.event.release.id || env.TARGET_RELEASE_ID }}
           assetNamePattern: "[name]-[platform]-[arch][ext]"
 
       - name: Notarize & Staple DMG (release only)
-        if: matrix.platform == 'macos-latest' && env.HAVE_NOTARIZE_SECRETS == 'true' && github.event_name == 'release'
+        if: matrix.platform == 'macos-latest' && env.HAVE_NOTARIZE_SECRETS == 'true' && (github.event_name == 'release' || inputs.release_tag != '')
         run: |
           DMG_PATH=$(find src-tauri/target -name "*.dmg" -print -quit)
           if [ -z "$DMG_PATH" ]; then
@@ -188,7 +203,7 @@ jobs:
 
   mark-latest:
     needs: build
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' || inputs.release_tag != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -206,4 +221,4 @@ jobs:
 
       - name: Mark release as latest
         run: |
-          gh release edit "${{ github.event.release.tag_name }}" --latest --repo "${{ github.repository }}"
+          gh release edit "${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}" --latest --repo "${{ github.repository }}"
