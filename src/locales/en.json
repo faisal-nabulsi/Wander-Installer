@@ -259,6 +259,12 @@
         "Change your anisette server. Try several different servers.",
         "Make sure you can access ((link:{{anisetteServerUrl}})) in a browser."
       ],
+      "apple_auth_unavailable": [
+        "Apple turned the sign-in request away before it looked at your Apple ID, so your email and password are not the problem.",
+        "This version of Wander Installer identifies itself to Apple in a way Apple started rejecting. Install the newest Wander Installer from ((link:https://wanderspoofer.com/download/)) and sign in again.",
+        "Changing the anisette server will not help, because every public anisette server sends the same identifier Apple is rejecting.",
+        "If you already have the newest version, Apple's sign-in service may be down right now. Wait a few minutes and try again."
+      ],
       "keyring": [
         "Try enabling \"Don't use keyring\" in settings to bypass this issue. Note that this is less secure."
       ],

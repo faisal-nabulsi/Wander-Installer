@@ -8,6 +8,7 @@ mod sideload;
 mod pairing;
 #[macro_use]
 mod secure_storage;
+mod anisette_patch;
 mod error;
 mod logging;
 mod operation;

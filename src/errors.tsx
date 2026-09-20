@@ -28,6 +28,7 @@ export const errorSuggestionKeys = {
   not_logged_in: ["error.suggestions.not_logged_in"],
   no_device_selected: ["error.suggestions.no_device_selected"],
   anisette: ["error.suggestions.anisette"],
+  apple_auth_unavailable: ["error.suggestions.apple_auth_unavailable"],
   keyring: ["error.suggestions.keyring", "error.suggestions.admin"],
   keyring_with_message: [
     "error.suggestions.keyring",
@@ -121,7 +122,7 @@ export const getErrorSuggestions = (
   anisetteServer: string,
 ): string[] => {
   return dedupeSuggestions(
-    errorSuggestionKeys[type].flatMap((key) =>
+    (errorSuggestionKeys[type] ?? errorSuggestionKeys.misc).flatMap((key) =>
       getSuggestionBlock(t, key, platform, anisetteServer),
     ),
   );

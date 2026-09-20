@@ -3066,8 +3066,9 @@ dependencies = [
 
 [[package]]
 name = "iloader"
-version = "2.3.0"
+version = "2.3.1"
 dependencies = [
+ "async-trait",
  "chrono",
  "futures",
  "idevice",

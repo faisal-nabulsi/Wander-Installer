@@ -17,6 +17,7 @@ use tauri_plugin_store::StoreExt;
 use tracing::debug;
 
 use crate::{
+    anisette_patch::AkdClientInfoProvider,
     error::AppError,
     secure_storage::create_sideloading_storage,
     sideload::{SideloaderGuard, SideloaderMutex},
@@ -191,12 +192,12 @@ async fn login(
     };
 
     let mut account = AppleAccount::builder(&email.to_lowercase())
-        .anisette_provider(
+        .anisette_provider(AkdClientInfoProvider(
             RemoteV3AnisetteProvider::default()?
                 .set_serial_number("0".to_string())
                 .set_storage(create_sideloading_storage(app)?)
                 .set_url(&anisette_url),
-        )
+        ))
         .login(password, tfa_closure)
         .await?;
 
