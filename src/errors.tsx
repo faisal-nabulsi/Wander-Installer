@@ -29,6 +29,7 @@ export const errorSuggestionKeys = {
   no_device_selected: ["error.suggestions.no_device_selected"],
   anisette: ["error.suggestions.anisette"],
   apple_auth_unavailable: ["error.suggestions.apple_auth_unavailable"],
+  apple_rate_limited: ["error.suggestions.apple_rate_limited"],
   keyring: ["error.suggestions.keyring", "error.suggestions.admin"],
   keyring_with_message: [
     "error.suggestions.keyring",

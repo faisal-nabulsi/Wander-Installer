@@ -46,6 +46,8 @@ pub enum AppError {
     #[error("{0}")]
     AppleAuthUnavailable(String),
     #[error("{0}")]
+    AppleRateLimited(String),
+    #[error("{0}")]
     Keyring(String),
     #[error("Keyring error: {0} - {1}")]
     KeyringWithMessage(String, String),
@@ -91,6 +93,11 @@ impl From<Report> for AppError {
                     .url()
                     .and_then(|url| url.host_str())
                     .is_some_and(|host| host == "gsa.apple.com");
+                if is_grandslam && err.status().is_some_and(|s| s.as_u16() == 429) {
+                    // Apple's edge also keeps a per-network budget of sign-in requests. Retrying
+                    // straight away keeps it exhausted, so the advice is to wait, not to retry.
+                    return AppError::AppleRateLimited(report_str);
+                }
                 if is_grandslam && err.status().is_some_and(|s| s.is_server_error()) {
                     return AppError::AppleAuthUnavailable(report_str);
                 }

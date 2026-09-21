@@ -1,6 +1,6 @@
 [package]
 name = "iloader"
-version = "2.3.1"
+version = "2.3.2"
 description = "User-friendly sideloader"
 authors = ["nab138"]
 edition = "2024"
@@ -47,3 +47,12 @@ strum = {version = "0.28.0", features = ["derive"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2"
+
+# isideload 0.2.22 with one line added (vendor/isideload/src/auth/grandslam.rs): disable
+# connection pooling on the GrandSlam client, mirroring upstream nab138/isideload f6a4d5d.
+# Apple's gsa.apple.com edge serves at most two requests per connection and 429s the rest, so
+# the SRP proof - the third request of every sign-in - always failed on a pooled connection.
+# Vendored instead of repinning to the upstream branch because that branch also drags idevice
+# 0.1.58 -> 0.1.68, which breaks the remote-pairing code.
+[patch.crates-io]
+isideload = { path = "vendor/isideload" }

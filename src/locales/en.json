@@ -259,6 +259,11 @@
         "Change your anisette server. Try several different servers.",
         "Make sure you can access ((link:{{anisetteServerUrl}})) in a browser."
       ],
+      "apple_rate_limited": [
+        "Apple is limiting sign-in attempts from your network right now. Your Apple ID and password are not the problem.",
+        "Wait a minute or two, then sign in once. Trying again straight away keeps the limit in place.",
+        "If it keeps happening, make sure you are on the newest Wander Installer from ((link:https://wanderspoofer.com/download/))."
+      ],
       "apple_auth_unavailable": [
         "Apple turned the sign-in request away before it looked at your Apple ID, so your email and password are not the problem.",
         "This version of Wander Installer identifies itself to Apple in a way Apple started rejecting. Install the newest Wander Installer from ((link:https://wanderspoofer.com/download/)) and sign in again.",
