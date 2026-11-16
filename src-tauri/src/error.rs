@@ -46,6 +46,8 @@ pub enum AppError {
     #[error("{0}")]
     AppleAuthUnavailable(String),
     #[error("{0}")]
+    AnisetteRejected(String),
+    #[error("{0}")]
     AppleRateLimited(String),
     #[error("{0}")]
     Keyring(String),
@@ -71,6 +73,16 @@ impl Serialize for AppError {
     }
 }
 
+/// Sign-in error codes that mean Apple (or the anisette server) refused the device identity
+/// rather than the Apple ID: -80045 (anisette platform does not match the client info, since
+/// 2026-10-12), -80046 (Android-generated anisette refused at the token step, since
+/// 2026-10-22) and -45061 (anisette not provisioned for this server).
+pub const ANISETTE_REJECTED_CODES: [i64; 3] = [-80045, -80046, -45061];
+
+pub fn is_anisette_rejected_code(code: i64) -> bool {
+    ANISETTE_REJECTED_CODES.contains(&code)
+}
+
 // from rootcause report
 impl From<Report> for AppError {
     fn from(report: Report) -> Self {
@@ -88,6 +100,15 @@ impl From<Report> for AppError {
         // a mistyped code or a 429 must keep its own message instead of being relabelled as a
         // stale-installer problem.
         for cause in report.iter_reports() {
+            // The anisette server kept answering -45061 even after the automatic
+            // re-provisioning. Checked here, before the generic anisette match below, because
+            // that one would otherwise claim it through its outer "Failed to get anisette data"
+            // context.
+            if let Some(SideloadError::AnisetteProvisioningExhausted(_)) =
+                cause.downcast_current_context::<SideloadError>()
+            {
+                return AppError::AnisetteRejected(report_str);
+            }
             if let Some(err) = cause.downcast_current_context::<reqwest::Error>() {
                 let is_grandslam = err
                     .url()
@@ -112,6 +133,9 @@ impl From<Report> for AppError {
                 match err {
                     &SideloadError::AuthWithMessage(code, _) => match code {
                         -20209 => return AppError::AccountLocked(report_str),
+                        code if is_anisette_rejected_code(code) => {
+                            return AppError::AnisetteRejected(report_str);
+                        }
                         _ => {
                             return AppError::Auth(report_str);
                         }
@@ -149,5 +173,64 @@ impl From<Report> for AppError {
         }
 
         AppError::Misc(report_str)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rootcause::prelude::*;
+
+    fn classify(err: SideloadError) -> AppError {
+        let report: Report = report!(err)
+            .context("GrandSlam error during initial login request")
+            .context("Failed to log in to Apple ID")
+            .into_dynamic();
+        AppError::from(report)
+    }
+
+    #[test]
+    fn anisette_rejections_get_their_own_error() {
+        // Hard-coded on purpose: the test checks the constant, so it must not loop over it.
+        for code in [-80045, -80046, -45061] {
+            let err = classify(SideloadError::AuthWithMessage(
+                code,
+                "This action cannot be completed at this time.".into(),
+            ));
+            assert!(
+                matches!(err, AppError::AnisetteRejected(_)),
+                "code {code} -> {:?}",
+                err
+            );
+            assert_eq!(err.as_ref(), "anisette_rejected");
+        }
+    }
+
+    #[test]
+    fn other_auth_codes_keep_their_mapping() {
+        assert!(matches!(
+            classify(SideloadError::AuthWithMessage(-20209, "locked".into())),
+            AppError::AccountLocked(_)
+        ));
+        assert!(matches!(
+            classify(SideloadError::AuthWithMessage(
+                -22406,
+                "bad password".into()
+            )),
+            AppError::Auth(_)
+        ));
+    }
+
+    #[test]
+    fn anisette_server_giving_up_on_45061_is_anisette_rejected() {
+        // The same typed error AnisetteDataGenerator raises, under the context login adds.
+        let report: Report = report!(SideloadError::AnisetteProvisioningExhausted(3))
+            .context("Failed to get anisette data for login")
+            .context("Failed to log in to Apple ID")
+            .into_dynamic();
+        assert!(matches!(
+            AppError::from(report),
+            AppError::AnisetteRejected(_)
+        ));
     }
 }

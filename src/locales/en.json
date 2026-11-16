@@ -259,6 +259,11 @@
         "Change your anisette server. Try several different servers.",
         "Make sure you can access ((link:{{anisetteServerUrl}})) in a browser."
       ],
+      "anisette_rejected": [
+        "Apple did not accept the device identity (called anisette) that your anisette server provided. Your Apple ID and password are not the problem.",
+        "Sign in again. Wander Installer sets up a fresh identity on its own, and that sometimes needs one more try.",
+        "If it keeps happening, open Settings, choose a different Anisette Server, and sign in again."
+      ],
       "apple_rate_limited": [
         "Apple is limiting sign-in attempts from your network right now. Your Apple ID and password are not the problem.",
         "Wait a minute or two, then sign in once. Trying again straight away keeps the limit in place.",

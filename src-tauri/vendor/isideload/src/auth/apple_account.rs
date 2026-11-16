@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
+    SideloadError,
     anisette::{AnisetteData, AnisetteDataGenerator},
     auth::{
         builder::AppleAccountBuilder,
@@ -36,10 +37,276 @@ pub struct AppleAccount {
 #[derive(Debug)]
 pub enum LoginState {
     LoggedIn,
+    /// Apple wants a trusted-device code and has not sent one yet: request it, then verify.
     NeedsDevice2FA,
+    /// A trusted-device code is already on its way (requested by us, or pushed by Apple with
+    /// hsc 409). Only ask the user for it and verify; requesting again cancels the pushed code.
+    NeedsDevice2FAVerification,
     NeedsSMS2FA,
     NeedsExtraStep(String),
     NeedsLogin,
+}
+
+/// GrandSlam / ADI error: the machine's anisette is not provisioned (or provisioned for a
+/// different anisette server).
+pub const ANISETTE_NOT_PROVISIONED: i64 = -45061;
+
+/// How many times a GrandSlam -45061 at the init step may trigger a fresh anisette
+/// provisioning before giving up (so at most this + 1 init requests).
+pub const MAX_GRANDSLAM_REPROVISIONS: usize = 2;
+
+/// Map the `Status` dictionary of the SRP "complete" response to the next login step.
+///
+/// Backport of nab138/isideload fdb1788: when Apple has already pushed a code to the user's
+/// trusted devices it answers `hsc = 409` and omits `au`. Treat that as trusted-device 2FA
+/// whose code is already sent, so the login loop does not call
+/// /auth/verify/trusteddevice again (which cancels the pushed code).
+pub(crate) fn login_state_from_status(status: &Dictionary) -> LoginState {
+    if let Some(plist::Value::String(s)) = status.get("au") {
+        return match s.as_str() {
+            "trustedDeviceSecondaryAuth" => LoginState::NeedsDevice2FA,
+            "secondaryAuth" => LoginState::NeedsSMS2FA,
+            "repair" => LoginState::LoggedIn, // Just means that you don't have 2FA set up
+            unknown => LoginState::NeedsExtraStep(unknown.to_string()),
+        };
+    }
+
+    if let Some(plist::Value::Integer(hsc)) = status.get("hsc") {
+        match hsc.as_signed() {
+            Some(200) => {}
+            Some(409) => {
+                info!("2FA code already sent to trusted devices (hsc 409)");
+                return LoginState::NeedsDevice2FAVerification;
+            }
+            Some(code) => warn!("Unknown hsc status code {} in login response", code),
+            None => warn!("Unknown hsc status code (invalid integer) in login response"),
+        }
+    }
+
+    LoginState::LoggedIn
+}
+
+/// Extracts the resync SIM (base64 `X-Apple-I-MD-DATA`) from a GSA response that demands an
+/// anisette resync (`Status.hsc == 434`); `None` otherwise. From nab138/isideload ac8976d.
+pub(crate) fn resync_sim(resp: &Dictionary) -> Option<String> {
+    let status = resp.get("Status")?.as_dictionary()?;
+    if status.get("hsc").and_then(plist::Value::as_signed_integer) != Some(434) {
+        return None;
+    }
+    match status.get("X-Apple-I-MD-DATA")? {
+        plist::Value::Data(d) => Some(BASE64_STANDARD.encode(d)),
+        plist::Value::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Whether a GrandSlam error at the init step should discard anisette and provision again,
+/// given how many re-provisions this login already did.
+pub(crate) fn should_reprovision_after(err: &SideloadError, reprovisions_done: usize) -> bool {
+    matches!(
+        err,
+        SideloadError::AuthWithMessage(ANISETTE_NOT_PROVISIONED, _)
+    ) && reprovisions_done < MAX_GRANDSLAM_REPROVISIONS
+}
+
+/// The two actions of the SRP init step, split out so the -45061 retry loop can be tested
+/// without the network.
+pub(crate) trait InitSteps {
+    /// Fetch anisette and send `o = init` (plus the hsc 434 resync). Returns the raw GrandSlam
+    /// reply, not yet checked for errors, and the client-provided data that was sent.
+    async fn attempt_init(&mut self) -> Result<(Dictionary, Dictionary), Report>;
+    /// Discard the cached anisette and provision from scratch.
+    async fn reprovision(&mut self) -> Result<(), Report>;
+}
+
+/// Send the init request; when GrandSlam answers -45061, re-provision anisette and try
+/// again, at most `MAX_GRANDSLAM_REPROVISIONS` times (so at most that + 1 init requests).
+pub(crate) async fn init_with_reprovision<S: InitSteps>(
+    steps: &mut S,
+) -> Result<(Dictionary, Dictionary), Report> {
+    let mut reprovisions = 0;
+    loop {
+        let (raw_response, cpd) = steps.attempt_init().await?;
+        let checked = raw_response.check_grandslam_error();
+        if let Err(ref err) = checked
+            && should_reprovision_after(err.current_context(), reprovisions)
+        {
+            reprovisions += 1;
+            warn!(
+                "Apple says the anisette is not provisioned (-45061); provisioning again ({}/{})",
+                reprovisions, MAX_GRANDSLAM_REPROVISIONS
+            );
+            steps
+                .reprovision()
+                .await
+                .context("Failed to provision anisette again after -45061")?;
+            continue;
+        }
+        let response = checked.context("GrandSlam error during initial login request")?;
+        return Ok((response, cpd));
+    }
+}
+
+struct LiveInit<'a> {
+    account: &'a mut AppleAccount,
+    gs_service_url: &'a str,
+    a_pub: &'a [u8],
+}
+
+impl InitSteps for LiveInit<'_> {
+    async fn attempt_init(&mut self) -> Result<(Dictionary, Dictionary), Report> {
+        let account = &mut *self.account;
+        let anisette_data = account
+            .anisette_generator
+            .get_anisette_data(account.grandslam_client.clone())
+            .await
+            .context("Failed to get anisette data for login")?;
+        let cpd = anisette_data.get_client_provided_data();
+
+        let mut raw_response = account
+            .send_init_request(self.gs_service_url, &cpd, self.a_pub)
+            .await
+            .context("Failed to send initial login request")?;
+
+        if let Some(sim) = resync_sim(&raw_response) {
+            debug!("Anisette resync required (hsc 434); syncing then retrying init");
+            let fresh = account
+                .anisette_generator
+                .resync(&sim)
+                .await
+                .context("Anisette resync failed")?;
+            raw_response = account
+                .send_init_request(
+                    self.gs_service_url,
+                    &fresh.get_client_provided_data(),
+                    self.a_pub,
+                )
+                .await
+                .context("Failed to send resynced init request")?;
+        }
+        Ok((raw_response, cpd))
+    }
+
+    async fn reprovision(&mut self) -> Result<(), Report> {
+        let account = &mut *self.account;
+        account
+            .anisette_generator
+            .force_reprovision(account.grandslam_client.clone())
+            .await
+    }
+}
+
+/// Most steps one sign-in may take after the first SRP exchange.
+pub const MAX_LOGIN_STEPS: usize = 10;
+
+/// The actions the post-init login loop can take, split out so the loop can be tested
+/// without the network.
+pub(crate) trait LoginSteps {
+    /// Run the SRP exchange again and map the reply to the next state.
+    async fn login_again(&mut self) -> Result<LoginState, Report>;
+    /// Ask Apple to push a code to the trusted devices (GET trustedDeviceSecondaryAuth).
+    async fn request_device_2fa(&mut self) -> Result<(), Report>;
+    /// Ask the user for the code that is already on its way and submit it.
+    async fn verify_device_2fa(&mut self) -> Result<(), Report>;
+    /// Request an SMS code, ask the user for it and submit it.
+    async fn sms_2fa(&mut self) -> Result<(), Report>;
+    /// Whether the session already holds a PET token (lets an unknown `au` step pass).
+    fn has_pet(&self) -> bool;
+}
+
+/// Drive the login state machine until signed in. `state` always holds the latest state,
+/// also when this returns an error.
+pub(crate) async fn drive_login<S: LoginSteps>(
+    steps: &mut S,
+    state: &mut LoginState,
+) -> Result<(), Report> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        if attempts > MAX_LOGIN_STEPS {
+            bail!(
+                "Couldn't login after {} attempts, aborting (current state: {:?})",
+                MAX_LOGIN_STEPS,
+                state
+            );
+        }
+        match state {
+            LoginState::LoggedIn => {
+                info!("Successfully logged in to Apple ID");
+                return Ok(());
+            }
+            LoginState::NeedsDevice2FA => {
+                steps
+                    .request_device_2fa()
+                    .await
+                    .context("Failed to complete trusted device 2FA")?;
+                *state = LoginState::NeedsDevice2FAVerification;
+            }
+            LoginState::NeedsDevice2FAVerification => {
+                // Never request here: the code is already on its way (requested above, or
+                // pushed by Apple with hsc 409), and requesting again cancels it.
+                steps
+                    .verify_device_2fa()
+                    .await
+                    .context("Failed to complete trusted device 2FA")?;
+                debug!("Trusted device 2FA completed, need to login again");
+                *state = LoginState::NeedsLogin;
+            }
+            LoginState::NeedsSMS2FA => {
+                info!("SMS 2FA required");
+                steps
+                    .sms_2fa()
+                    .await
+                    .context("Failed to complete SMS 2FA")?;
+                debug!("SMS 2FA completed, need to login again");
+                *state = LoginState::NeedsLogin;
+            }
+            LoginState::NeedsExtraStep(s) => {
+                info!("Additional authentication step required: {}", s);
+                if !steps.has_pet() {
+                    bail!("Additional authentication required: {}", s);
+                }
+                *state = LoginState::LoggedIn;
+            }
+            LoginState::NeedsLogin => {
+                debug!("Logging in again...");
+                *state = steps
+                    .login_again()
+                    .await
+                    .context("Failed to login again")?;
+            }
+        }
+    }
+}
+
+struct LiveLogin<'a, F> {
+    account: &'a mut AppleAccount,
+    password: &'a str,
+    two_factor_callback: &'a F,
+}
+
+impl<F: Fn() -> Option<String>> LoginSteps for LiveLogin<'_, F> {
+    async fn login_again(&mut self) -> Result<LoginState, Report> {
+        self.account.login_inner(self.password).await
+    }
+
+    async fn request_device_2fa(&mut self) -> Result<(), Report> {
+        self.account.request_trusted_device_2fa().await
+    }
+
+    async fn verify_device_2fa(&mut self) -> Result<(), Report> {
+        self.account
+            .verify_trusted_device_2fa(self.two_factor_callback)
+            .await
+    }
+
+    async fn sms_2fa(&mut self) -> Result<(), Report> {
+        self.account.sms_2fa(self.two_factor_callback).await
+    }
+
+    fn has_pet(&self) -> bool {
+        self.account.get_pet().is_ok()
+    }
 }
 
 impl AppleAccount {
@@ -107,52 +374,17 @@ impl AppleAccount {
 
         debug!("Initial login successful");
 
-        let mut attempts = 0;
-
-        loop {
-            attempts += 1;
-            if attempts > 10 {
-                bail!(
-                    "Couldn't login after 10 attempts, aborting (current state: {:?})",
-                    self.login_state
-                );
-            }
-            match &self.login_state {
-                LoginState::LoggedIn => {
-                    info!("Successfully logged in to Apple ID");
-                    return Ok(());
-                }
-                LoginState::NeedsDevice2FA => {
-                    self.trusted_device_2fa(&two_factor_callback)
-                        .await
-                        .context("Failed to complete trusted device 2FA")?;
-                    debug!("Trusted device 2FA completed, need to login again");
-                    self.login_state = LoginState::NeedsLogin;
-                }
-                LoginState::NeedsSMS2FA => {
-                    info!("SMS 2FA required");
-                    self.sms_2fa(&two_factor_callback)
-                        .await
-                        .context("Failed to complete SMS 2FA")?;
-                    debug!("SMS 2FA completed, need to login again");
-                    self.login_state = LoginState::NeedsLogin;
-                }
-                LoginState::NeedsExtraStep(s) => {
-                    info!("Additional authentication step required: {}", s);
-                    if self.get_pet().is_err() {
-                        bail!("Additional authentication required: {}", s);
-                    }
-                    self.login_state = LoginState::LoggedIn;
-                }
-                LoginState::NeedsLogin => {
-                    debug!("Logging in again...");
-                    self.login_state = self
-                        .login_inner(password)
-                        .await
-                        .context("Failed to login again")?;
-                }
-            }
-        }
+        let mut state = std::mem::replace(&mut self.login_state, LoginState::NeedsLogin);
+        let result = {
+            let mut steps = LiveLogin {
+                account: self,
+                password,
+                two_factor_callback: &two_factor_callback,
+            };
+            drive_login(&mut steps, &mut state).await
+        };
+        self.login_state = state;
+        result
     }
 
     /// Get the user's first and last name associated with the Apple ID
@@ -179,10 +411,8 @@ impl AppleAccount {
         Ok(pet)
     }
 
-    async fn trusted_device_2fa(
-        &mut self,
-        two_factor_callback: impl Fn() -> Option<String>,
-    ) -> Result<(), Report> {
+    /// Ask Apple to push a code to the user's trusted devices.
+    async fn request_trusted_device_2fa(&mut self) -> Result<(), Report> {
         debug!("Trusted device 2FA required");
 
         let anisette_data = self
@@ -195,8 +425,6 @@ impl AppleAccount {
             .grandslam_client
             .get_url("trustedDeviceSecondaryAuth")?;
 
-        let submit_code_url = self.grandslam_client.get_url("validateCode")?;
-
         self.grandslam_client
             .get(&request_code_url)?
             .headers(self.build_2fa_headers(&anisette_data).await?)
@@ -208,8 +436,26 @@ impl AppleAccount {
 
         info!("Trusted device 2FA request sent");
 
+        Ok(())
+    }
+
+    /// Ask the user for the trusted-device code that is already on its way and submit it.
+    async fn verify_trusted_device_2fa(
+        &mut self,
+        two_factor_callback: impl Fn() -> Option<String>,
+    ) -> Result<(), Report> {
         let code =
             two_factor_callback().ok_or_else(|| report!("No 2FA code provided, aborting"))?;
+
+        // Fetched after the user typed the code (which can take up to two minutes) so the
+        // one-time password is fresh, instead of reusing the one from before the prompt.
+        let anisette_data = self
+            .anisette_generator
+            .get_anisette_data(self.grandslam_client.clone())
+            .await
+            .context("Failed to get anisette data for 2FA")?;
+
+        let submit_code_url = self.grandslam_client.get_url("validateCode")?;
 
         let res = self
             .grandslam_client
@@ -262,6 +508,13 @@ impl AppleAccount {
 
         let code =
             two_factor_callback().ok_or_else(|| report!("No 2FA code provided, aborting"))?;
+
+        // Fresh anisette for the submission: the user may have taken a while to type the code.
+        let anisette_data = self
+            .anisette_generator
+            .get_anisette_data(self.grandslam_client.clone())
+            .await
+            .context("Failed to get anisette data for 2FA")?;
 
         let body = serde_json::json!({
             "securityCode": {
@@ -358,46 +611,19 @@ impl AppleAccount {
     }
 
     async fn login_inner(&mut self, password: &str) -> Result<LoginState, Report> {
-        let anisette_data = self
-            .anisette_generator
-            .get_anisette_data(self.grandslam_client.clone())
-            .await
-            .context("Failed to get anisette data for login")?;
-
         let gs_service_url = self.grandslam_client.get_url("gsService")?;
         debug!("GrandSlam service URL: {}", gs_service_url);
-
-        let cpd = anisette_data.get_client_provided_data();
 
         let srp_client = srp::Client::<G2048, Sha256>::new_with_options(false);
         let a: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
         let a_pub = srp_client.compute_public_ephemeral(&a);
 
-        let req1 = plist!(dict {
-            "Header": {
-                "Version": "1.0.1"
-            },
-            "Request": {
-                "A2k": a_pub, // A2k = client public ephemeral
-                "cpd": cpd.clone(), // cpd = client provided data
-                "o": "init", // o = operation
-                "ps": [ // ps = protocols supported
-                    "s2k",
-                    "s2k_fo"
-                ],
-                "u": self.email.clone(), // u = username
-            }
-        });
-
-        debug!("Sending initial login request");
-
-        let response = self
-            .grandslam_client
-            .plist_request(&gs_service_url, &req1, None)
-            .await
-            .context("Failed to send initial login request")?
-            .check_grandslam_error()
-            .context("GrandSlam error during initial login request")?;
+        let (response, cpd) = init_with_reprovision(&mut LiveInit {
+            account: self,
+            gs_service_url: &gs_service_url,
+            a_pub: &a_pub,
+        })
+        .await?;
 
         debug!("Login step 1 completed");
 
@@ -496,16 +722,36 @@ impl AppleAccount {
 
         debug!("Login step 2 completed");
 
-        if let Some(plist::Value::String(s)) = status.get("au") {
-            return Ok(match s.as_str() {
-                "trustedDeviceSecondaryAuth" => LoginState::NeedsDevice2FA,
-                "secondaryAuth" => LoginState::NeedsSMS2FA,
-                "repair" => LoginState::LoggedIn, // Just means that you don't have 2FA set up
-                unknown => LoginState::NeedsExtraStep(unknown.to_string()),
-            });
-        }
+        Ok(login_state_from_status(status))
+    }
 
-        Ok(LoginState::LoggedIn)
+    async fn send_init_request(
+        &self,
+        gs_service_url: &str,
+        cpd: &Dictionary,
+        a_pub: &[u8],
+    ) -> Result<Dictionary, Report> {
+        let req1 = plist!(dict {
+            "Header": {
+                "Version": "1.0.1"
+            },
+            "Request": {
+                "A2k": a_pub.to_vec(), // A2k = client public ephemeral
+                "cpd": cpd.clone(), // cpd = client provided data
+                "o": "init", // o = operation
+                "ps": [ // ps = protocols supported
+                    "s2k",
+                    "s2k_fo"
+                ],
+                "u": self.email.clone(), // u = username
+            }
+        });
+
+        debug!("Sending initial login request");
+
+        self.grandslam_client
+            .plist_request(gs_service_url, &req1, None)
+            .await
     }
 
     pub async fn get_app_token(&mut self, app: &str) -> Result<AppToken, Report> {
@@ -714,5 +960,331 @@ fn censor_email(email: &str) -> String {
         }
     } else {
         "***".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(entries: Vec<(&str, plist::Value)>) -> Dictionary {
+        let mut d = Dictionary::new();
+        for (k, v) in entries {
+            d.insert(k.to_string(), v);
+        }
+        d
+    }
+
+    #[test]
+    fn hsc_409_without_au_means_code_already_pushed() {
+        let s = status(vec![("hsc", plist::Value::Integer(409.into()))]);
+        assert!(matches!(
+            login_state_from_status(&s),
+            LoginState::NeedsDevice2FAVerification
+        ));
+    }
+
+    #[test]
+    fn au_takes_precedence_over_hsc() {
+        let s = status(vec![
+            (
+                "au",
+                plist::Value::String("trustedDeviceSecondaryAuth".into()),
+            ),
+            ("hsc", plist::Value::Integer(409.into())),
+        ]);
+        assert!(matches!(
+            login_state_from_status(&s),
+            LoginState::NeedsDevice2FA
+        ));
+    }
+
+    #[test]
+    fn au_values_map_as_before() {
+        let sms = status(vec![("au", plist::Value::String("secondaryAuth".into()))]);
+        assert!(matches!(
+            login_state_from_status(&sms),
+            LoginState::NeedsSMS2FA
+        ));
+        let repair = status(vec![("au", plist::Value::String("repair".into()))]);
+        assert!(matches!(
+            login_state_from_status(&repair),
+            LoginState::LoggedIn
+        ));
+        let other = status(vec![("au", plist::Value::String("somethingNew".into()))]);
+        assert!(
+            matches!(login_state_from_status(&other), LoginState::NeedsExtraStep(ref s) if s == "somethingNew")
+        );
+    }
+
+    #[test]
+    fn hsc_200_or_nothing_is_logged_in() {
+        assert!(matches!(
+            login_state_from_status(&status(vec![])),
+            LoginState::LoggedIn
+        ));
+        let ok = status(vec![("hsc", plist::Value::Integer(200.into()))]);
+        assert!(matches!(login_state_from_status(&ok), LoginState::LoggedIn));
+    }
+
+    #[test]
+    fn resync_sim_only_for_hsc_434() {
+        let sim_bytes = vec![1u8, 2, 3];
+        let resp_434 = status(vec![(
+            "Status",
+            plist::Value::Dictionary(status(vec![
+                ("hsc", plist::Value::Integer(434.into())),
+                ("X-Apple-I-MD-DATA", plist::Value::Data(sim_bytes.clone())),
+            ])),
+        )]);
+        assert_eq!(
+            resync_sim(&resp_434),
+            Some(BASE64_STANDARD.encode(&sim_bytes))
+        );
+
+        let resp_string = status(vec![(
+            "Status",
+            plist::Value::Dictionary(status(vec![
+                ("hsc", plist::Value::Integer(434.into())),
+                ("X-Apple-I-MD-DATA", plist::Value::String("AQID".into())),
+            ])),
+        )]);
+        assert_eq!(resync_sim(&resp_string), Some("AQID".to_string()));
+
+        let resp_409 = status(vec![(
+            "Status",
+            plist::Value::Dictionary(status(vec![("hsc", plist::Value::Integer(409.into()))])),
+        )]);
+        assert_eq!(resync_sim(&resp_409), None);
+        assert_eq!(resync_sim(&status(vec![])), None);
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+    }
+
+    fn gs_error(code: i64) -> Dictionary {
+        status(vec![(
+            "Status",
+            plist::Value::Dictionary(status(vec![
+                ("ec", plist::Value::Integer(code.into())),
+                ("em", plist::Value::String("msg".into())),
+            ])),
+        )])
+    }
+
+    fn gs_ok() -> Dictionary {
+        status(vec![
+            (
+                "Status",
+                plist::Value::Dictionary(status(vec![("ec", plist::Value::Integer(0.into()))])),
+            ),
+            ("sp", plist::Value::String("s2k".into())),
+        ])
+    }
+
+    /// Replays scripted GrandSlam init replies; errors once the script runs out, so a
+    /// runaway loop fails the test instead of hanging it.
+    struct ScriptedInit {
+        replies: Vec<Dictionary>,
+        inits: usize,
+        reprovisions: usize,
+    }
+
+    impl ScriptedInit {
+        fn new(replies: Vec<Dictionary>) -> Self {
+            Self {
+                replies,
+                inits: 0,
+                reprovisions: 0,
+            }
+        }
+    }
+
+    impl InitSteps for ScriptedInit {
+        async fn attempt_init(&mut self) -> Result<(Dictionary, Dictionary), Report> {
+            self.inits += 1;
+            if self.replies.is_empty() {
+                bail!("script exhausted: init sent too many times");
+            }
+            Ok((self.replies.remove(0), Dictionary::new()))
+        }
+        async fn reprovision(&mut self) -> Result<(), Report> {
+            self.reprovisions += 1;
+            Ok(())
+        }
+    }
+
+    fn error_code(err: &Report) -> Option<i64> {
+        err.iter_reports().find_map(|r| {
+            match r.downcast_current_context::<SideloadError>() {
+                Some(SideloadError::AuthWithMessage(code, _)) => Some(*code),
+                _ => None,
+            }
+        })
+    }
+
+    #[test]
+    fn grandslam_minus_45061_reprovisions_a_bounded_number_of_times() {
+        let mut steps = ScriptedInit::new(vec![
+            gs_error(ANISETTE_NOT_PROVISIONED);
+            MAX_GRANDSLAM_REPROVISIONS + 1
+        ]);
+        let err = rt()
+            .block_on(init_with_reprovision(&mut steps))
+            .expect_err("must give up");
+        assert_eq!(error_code(&err), Some(ANISETTE_NOT_PROVISIONED), "{err}");
+        assert_eq!(steps.inits, MAX_GRANDSLAM_REPROVISIONS + 1);
+        assert_eq!(steps.reprovisions, MAX_GRANDSLAM_REPROVISIONS);
+    }
+
+    #[test]
+    fn grandslam_minus_45061_once_then_success() {
+        let mut steps = ScriptedInit::new(vec![gs_error(ANISETTE_NOT_PROVISIONED), gs_ok()]);
+        let (response, _cpd) = rt().block_on(init_with_reprovision(&mut steps)).unwrap();
+        assert_eq!(response.get("sp"), Some(&plist::Value::String("s2k".into())));
+        assert_eq!(steps.inits, 2);
+        assert_eq!(steps.reprovisions, 1);
+    }
+
+    #[test]
+    fn other_init_errors_fail_without_reprovisioning() {
+        let mut steps = ScriptedInit::new(vec![gs_error(-80045)]);
+        let err = rt()
+            .block_on(init_with_reprovision(&mut steps))
+            .expect_err("-80045 is fatal");
+        assert_eq!(error_code(&err), Some(-80045));
+        assert_eq!(steps.inits, 1);
+        assert_eq!(steps.reprovisions, 0);
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Call {
+        Login,
+        Request,
+        Verify,
+        Sms,
+    }
+
+    struct ScriptedLogin {
+        logins: Vec<LoginState>,
+        calls: Vec<Call>,
+        pet: bool,
+    }
+
+    impl ScriptedLogin {
+        fn new(logins: Vec<LoginState>) -> Self {
+            Self {
+                logins,
+                calls: Vec::new(),
+                pet: false,
+            }
+        }
+    }
+
+    impl LoginSteps for ScriptedLogin {
+        async fn login_again(&mut self) -> Result<LoginState, Report> {
+            self.calls.push(Call::Login);
+            if self.logins.is_empty() {
+                bail!("script exhausted");
+            }
+            Ok(self.logins.remove(0))
+        }
+        async fn request_device_2fa(&mut self) -> Result<(), Report> {
+            self.calls.push(Call::Request);
+            Ok(())
+        }
+        async fn verify_device_2fa(&mut self) -> Result<(), Report> {
+            self.calls.push(Call::Verify);
+            Ok(())
+        }
+        async fn sms_2fa(&mut self) -> Result<(), Report> {
+            self.calls.push(Call::Sms);
+            Ok(())
+        }
+        fn has_pet(&self) -> bool {
+            self.pet
+        }
+    }
+
+    fn drive(steps: &mut ScriptedLogin, initial: LoginState) -> (Result<(), Report>, LoginState) {
+        let mut state = initial;
+        let result = rt().block_on(drive_login(steps, &mut state));
+        (result, state)
+    }
+
+    #[test]
+    fn pushed_code_is_verified_without_requesting_a_new_one() {
+        // hsc 409: Apple already pushed the code. Requesting again would cancel it.
+        let mut steps = ScriptedLogin::new(vec![LoginState::LoggedIn]);
+        let (result, state) = drive(&mut steps, LoginState::NeedsDevice2FAVerification);
+        result.unwrap();
+        assert!(matches!(state, LoginState::LoggedIn));
+        assert_eq!(steps.calls, vec![Call::Verify, Call::Login]);
+    }
+
+    #[test]
+    fn trusted_device_2fa_requests_once_then_verifies() {
+        let mut steps = ScriptedLogin::new(vec![LoginState::LoggedIn]);
+        let (result, _) = drive(&mut steps, LoginState::NeedsDevice2FA);
+        result.unwrap();
+        assert_eq!(steps.calls, vec![Call::Request, Call::Verify, Call::Login]);
+    }
+
+    #[test]
+    fn sms_2fa_then_login() {
+        let mut steps = ScriptedLogin::new(vec![LoginState::LoggedIn]);
+        let (result, _) = drive(&mut steps, LoginState::NeedsSMS2FA);
+        result.unwrap();
+        assert_eq!(steps.calls, vec![Call::Sms, Call::Login]);
+    }
+
+    #[test]
+    fn extra_step_needs_a_pet() {
+        let mut steps = ScriptedLogin::new(vec![]);
+        let (result, _) = drive(&mut steps, LoginState::NeedsExtraStep("x".into()));
+        assert!(result.is_err());
+        let mut steps = ScriptedLogin::new(vec![]);
+        steps.pet = true;
+        let (result, state) = drive(&mut steps, LoginState::NeedsExtraStep("x".into()));
+        result.unwrap();
+        assert!(matches!(state, LoginState::LoggedIn));
+    }
+
+    #[test]
+    fn login_loop_is_capped() {
+        let mut steps = ScriptedLogin::new((0..20).map(|_| LoginState::NeedsLogin).collect());
+        let (result, state) = drive(&mut steps, LoginState::NeedsLogin);
+        let err = result.expect_err("must give up").to_string();
+        assert!(err.contains("Couldn't login after 10 attempts"), "{err}");
+        assert!(matches!(state, LoginState::NeedsLogin));
+        assert_eq!(steps.calls.len(), MAX_LOGIN_STEPS);
+    }
+
+    #[test]
+    fn other_grandslam_errors_do_not_reprovision() {
+        for code in [-80045, -80046, -22406, -20209] {
+            let err = SideloadError::AuthWithMessage(code, "x".into());
+            assert!(!should_reprovision_after(&err, 0), "code {code}");
+        }
+        assert!(!should_reprovision_after(
+            &SideloadError::DeveloperError(ANISETTE_NOT_PROVISIONED, "x".into()),
+            0
+        ));
+    }
+
+    #[test]
+    fn check_grandslam_error_exposes_the_code_for_the_retry_decision() {
+        let resp = status(vec![(
+            "Status",
+            plist::Value::Dictionary(status(vec![
+                ("ec", plist::Value::Integer(ANISETTE_NOT_PROVISIONED.into())),
+                ("em", plist::Value::String("not provisioned".into())),
+            ])),
+        )]);
+        let err = resp.check_grandslam_error().expect_err("ec != 0");
+        assert!(should_reprovision_after(err.current_context(), 0));
     }
 }

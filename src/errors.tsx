@@ -28,6 +28,7 @@ export const errorSuggestionKeys = {
   not_logged_in: ["error.suggestions.not_logged_in"],
   no_device_selected: ["error.suggestions.no_device_selected"],
   anisette: ["error.suggestions.anisette"],
+  anisette_rejected: ["error.suggestions.anisette_rejected"],
   apple_auth_unavailable: ["error.suggestions.apple_auth_unavailable"],
   apple_rate_limited: ["error.suggestions.apple_rate_limited"],
   keyring: ["error.suggestions.keyring", "error.suggestions.admin"],

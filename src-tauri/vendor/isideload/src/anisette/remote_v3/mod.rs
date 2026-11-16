@@ -13,15 +13,18 @@ use tokio::time::{Duration, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
-use crate::SideloadError;
 use crate::anisette::remote_v3::state::AnisetteState;
-use crate::anisette::{AnisetteClientInfo, AnisetteData, AnisetteProvider};
+use crate::anisette::{AnisetteClientInfo, AnisetteData, AnisetteDataResponse, AnisetteProvider};
 use crate::auth::grandslam::GrandSlam;
 use crate::util::plist::PlistDataExtract;
 use crate::util::storage::{SideloadingStorage, new_storage};
 use futures_util::{SinkExt, StreamExt};
 
-pub const DEFAULT_ANISETTE_V3_URL: &str = "https://ani.stikstore.app";
+pub const DEFAULT_ANISETTE_V3_URL: &str = "https://mac-ani.jkcoxson.com";
+/// Storage key of the provisioned anisette state (an XML plist).
+pub const ANISETTE_STATE_KEY: &str = "anisette_state";
+/// Storage key of the server URL `ANISETTE_STATE_KEY` was provisioned against.
+pub const ANISETTE_STATE_URL_KEY: &str = "anisette_state_url";
 
 pub struct RemoteV3AnisetteProvider {
     pub state: Option<AnisetteState>,
@@ -29,6 +32,9 @@ pub struct RemoteV3AnisetteProvider {
     storage: Box<dyn SideloadingStorage>,
     serial_number: String,
     client_info: Option<AnisetteClientInfo>,
+    /// Backport of nab138/isideload 20b06c7: when set, this is reported as the client info
+    /// and the server's /v3/client_info is never fetched.
+    client_info_override: Option<AnisetteClientInfo>,
     client: reqwest::Client,
 }
 
@@ -50,6 +56,7 @@ impl RemoteV3AnisetteProvider {
             storage,
             serial_number,
             client_info: None,
+            client_info_override: None,
             client: reqwest::ClientBuilder::new()
                 .build()
                 .context("Failed to build HTTP client")?,
@@ -78,66 +85,39 @@ impl RemoteV3AnisetteProvider {
         self.serial_number = serial_number;
         self
     }
+
+    /// Report this client info instead of the server's /v3/client_info (nab138/isideload
+    /// 20b06c7). With an override set, the server's client_info endpoint is never contacted.
+    pub fn set_client_info_override(
+        mut self,
+        client_info_override: Option<AnisetteClientInfo>,
+    ) -> RemoteV3AnisetteProvider {
+        self.client_info_override = client_info_override;
+        self
+    }
+
+    /// The client info headers are built from: the override, else what the server reported.
+    fn effective_client_info(&self) -> Option<&AnisetteClientInfo> {
+        self.client_info_override
+            .as_ref()
+            .or(self.client_info.as_ref())
+    }
 }
 
 #[async_trait::async_trait]
 impl AnisetteProvider for RemoteV3AnisetteProvider {
-    async fn get_anisette_data(&self) -> Result<AnisetteData, Report> {
-        let state = self
-            .state
-            .as_ref()
-            .ok_or(SideloadError::AnisetteNotProvisioned)?;
-        let adi_pb = state
-            .adi_pb
-            .as_ref()
-            .ok_or(SideloadError::AnisetteNotProvisioned)?;
-        let client_info = self
-            .client_info
-            .as_ref()
-            .ok_or(SideloadError::AnisetteNotProvisioned)?;
+    async fn get_anisette_data(&self) -> Result<AnisetteDataResponse, Report> {
+        self.fetch_headers(None).await
+    }
 
-        let headers = self
-            .client
-            .post(format!("{}/v3/get_headers", self.url))
-            .header(CONTENT_TYPE, "application/json")
-            .body(
-                serde_json::json!({
-                "identifier": BASE64_STANDARD.encode(state.keychain_identifier),
-                "adi_pb": BASE64_STANDARD.encode(adi_pb)
-                })
-                .to_string(),
-            )
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<AnisetteHeaders>()
-            .await?;
-
-        match headers {
-            AnisetteHeaders::Headers {
-                machine_id,
-                one_time_password,
-                routing_info,
-            } => {
-                let data = AnisetteData {
-                    machine_id,
-                    one_time_password,
-                    routing_info,
-                    _device_description: client_info.client_info.clone(),
-                    device_unique_identifier: state.get_device_id(),
-                    _local_user_id: hex::encode(state.get_md_lu()),
-                    generated_at: SystemTime::now(),
-                };
-
-                Ok(data)
-            }
-            AnisetteHeaders::GetHeadersError { message } => {
-                Err(report!("Failed to get anisette headers").attach(message))
-            }
-        }
+    async fn resync(&self, sim: &str) -> Result<AnisetteDataResponse, Report> {
+        self.fetch_headers(Some(sim)).await
     }
 
     async fn get_client_info(&mut self) -> Result<AnisetteClientInfo, Report> {
+        if let Some(client_info_override) = self.client_info_override.as_ref() {
+            return Ok(client_info_override.clone());
+        }
         match self.client_info {
             Some(ref info) => Ok(info.clone()),
             None => {
@@ -156,37 +136,168 @@ impl AnisetteProvider for RemoteV3AnisetteProvider {
         }
     }
 
-    fn needs_provisioning(&self) -> Result<bool, Report> {
-        if let Some(state) = &self.state {
-            Ok(!state.is_provisioned() || self.client_info.is_none())
-        } else {
-            Ok(true)
-        }
-    }
-
-    async fn provision(&mut self, gs: Arc<GrandSlam>) -> Result<(), Report> {
+    async fn provision(&mut self, gs: Arc<GrandSlam>, force_reset: bool) -> Result<(), Report> {
         self.get_client_info().await?;
-        self.get_state(gs).await?;
+        self.get_state(gs, force_reset).await?;
         Ok(())
     }
 }
 
-impl RemoteV3AnisetteProvider {
-    async fn get_state(&mut self, gs: Arc<GrandSlam>) -> Result<&mut AnisetteState, Report> {
-        if self.state.is_none() {
-            if let Ok(Some(state)) = &self.storage.retrieve_data("anisette_state") {
-                if let Ok(state) = plist::from_bytes(state) {
-                    info!("Loaded existing anisette state");
-                    self.state = Some(state);
-                } else {
-                    warn!("Failed to parse existing anisette state, starting fresh");
-                    self.state = Some(AnisetteState::new());
-                }
-            } else {
-                info!("No existing anisette state found");
-                self.state = Some(AnisetteState::new());
-            }
+/// Server identity used to decide whether stored state belongs to the configured server:
+/// lowercased, scheme kept, trailing slashes dropped.
+pub fn normalize_anisette_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+/// Stored anisette state is only reused when it was provisioned against the server that is
+/// configured now. State from before 2.3.3 has no marker, so it was provisioned against an
+/// old (Android-backed) server and must not be reused either.
+pub fn stored_state_matches_server(stored_url: Option<&str>, current_url: &str) -> bool {
+    match stored_url {
+        Some(stored) if !stored.trim().is_empty() => {
+            normalize_anisette_url(stored) == normalize_anisette_url(current_url)
         }
+        _ => false,
+    }
+}
+
+/// The anisette-v3 server reports ADI error -45061 when the identifier/adi_pb it was given
+/// is not provisioned for it (for example after switching servers).
+pub fn is_incorrectly_provisioned_message(message: &str) -> bool {
+    message.contains("-45061")
+}
+
+/// Turn a /v3/get_headers reply into what the generator acts on. A -45061 from the server
+/// means "re-provision", not a failed sign-in (nab138/isideload 8ca39b6).
+fn headers_to_response(
+    headers: AnisetteHeaders,
+    state: &AnisetteState,
+    client_info: &AnisetteClientInfo,
+) -> Result<AnisetteDataResponse, Report> {
+    match headers {
+        AnisetteHeaders::Headers {
+            machine_id,
+            one_time_password,
+            routing_info,
+        } => Ok(AnisetteDataResponse::Data(AnisetteData {
+            machine_id,
+            one_time_password,
+            routing_info,
+            _device_description: client_info.client_info.clone(),
+            device_unique_identifier: state.get_device_id(),
+            _local_user_id: hex::encode(state.get_md_lu()),
+            generated_at: SystemTime::now(),
+        })),
+        AnisetteHeaders::GetHeadersError { message } => {
+            if is_incorrectly_provisioned_message(&message) {
+                warn!("Anisette server says this state is not provisioned (-45061)");
+                return Ok(AnisetteDataResponse::IncorrectlyProvisioned);
+            }
+            Err(report!("Failed to get anisette headers").attach(message))
+        }
+    }
+}
+
+/// Pick the state to provision or use: a fresh one on `force_reset`; the state already in
+/// memory if there is one; otherwise the stored state, but only when its server marker
+/// matches `url` (else a fresh one).
+fn select_state(
+    current: Option<AnisetteState>,
+    storage: &dyn SideloadingStorage,
+    url: &str,
+    force_reset: bool,
+) -> AnisetteState {
+    if force_reset {
+        warn!("Discarding cached anisette state and provisioning again");
+        return AnisetteState::new();
+    }
+    if let Some(state) = current {
+        return state;
+    }
+    let stored_url = storage.retrieve(ANISETTE_STATE_URL_KEY).ok().flatten();
+    if !stored_state_matches_server(stored_url.as_deref(), url) {
+        info!("Anisette server changed (or state predates the server marker), provisioning again");
+        return AnisetteState::new();
+    }
+    match storage.retrieve_data(ANISETTE_STATE_KEY) {
+        Ok(Some(bytes)) => match plist::from_bytes(&bytes) {
+            Ok(state) => {
+                info!("Loaded existing anisette state");
+                state
+            }
+            Err(_) => {
+                warn!("Failed to parse existing anisette state, starting fresh");
+                AnisetteState::new()
+            }
+        },
+        _ => {
+            info!("No existing anisette state found");
+            AnisetteState::new()
+        }
+    }
+}
+
+/// Store the state together with the marker of the server it was provisioned against.
+fn save_state(
+    storage: &dyn SideloadingStorage,
+    url: &str,
+    state: &AnisetteState,
+) -> Result<(), Report> {
+    let mut writer = std::io::BufWriter::new(Vec::new());
+    plist::to_writer_xml(&mut writer, state)?;
+    storage.store_data(ANISETTE_STATE_KEY, &writer.into_inner()?)?;
+    storage.store(ANISETTE_STATE_URL_KEY, &normalize_anisette_url(url))?;
+    Ok(())
+}
+
+impl RemoteV3AnisetteProvider {
+    async fn fetch_headers(&self, sim: Option<&str>) -> Result<AnisetteDataResponse, Report> {
+        let Some(state) = self.state.as_ref() else {
+            return Ok(AnisetteDataResponse::NeedsProvisioning);
+        };
+        let Some(adi_pb) = state.adi_pb.as_ref() else {
+            return Ok(AnisetteDataResponse::NeedsProvisioning);
+        };
+        let Some(client_info) = self.effective_client_info() else {
+            return Ok(AnisetteDataResponse::NeedsProvisioning);
+        };
+
+        let mut body = serde_json::json!({
+            "identifier": BASE64_STANDARD.encode(state.keychain_identifier),
+            "adi_pb": BASE64_STANDARD.encode(adi_pb),
+        });
+        if let Some(sim) = sim {
+            body["sim"] = serde_json::Value::String(sim.to_string());
+            body["device_id"] = serde_json::Value::String(state.get_device_id());
+            body["md_lu"] = serde_json::Value::String(hex::encode(state.get_md_lu()));
+        }
+
+        let headers = self
+            .client
+            .post(format!("{}/v3/get_headers", self.url))
+            .header(CONTENT_TYPE, "application/json")
+            .body(body.to_string())
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<AnisetteHeaders>()
+            .await?;
+
+        headers_to_response(headers, state, client_info)
+    }
+
+    async fn get_state(
+        &mut self,
+        gs: Arc<GrandSlam>,
+        force_reset: bool,
+    ) -> Result<&mut AnisetteState, Report> {
+        let current = self.state.take();
+        self.state = Some(select_state(
+            current,
+            self.storage.as_ref(),
+            &self.url,
+            force_reset,
+        ));
 
         let state = self.state.as_mut().ok_or_report()?;
         if !state.is_provisioned() {
@@ -195,11 +306,7 @@ impl RemoteV3AnisetteProvider {
                 .await
                 .context("Failed to provision")?;
         }
-        let buf = Vec::new();
-        let mut writer = std::io::BufWriter::new(buf);
-        plist::to_writer_xml(&mut writer, &state)?;
-        self.storage
-            .store_data("anisette_state", &writer.into_inner()?)?;
+        save_state(self.storage.as_ref(), &self.url, state)?;
 
         Ok(state)
     }
@@ -403,4 +510,224 @@ enum AnisetteHeaders {
         #[serde(rename = "X-Apple-I-MD-RINFO")]
         routing_info: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::storage::InMemoryStorage;
+
+    #[test]
+    fn stored_state_is_reused_only_for_the_same_server() {
+        let url = "https://mac-ani.jkcoxson.com";
+        assert!(stored_state_matches_server(Some(url), url));
+        assert!(stored_state_matches_server(
+            Some("https://MAC-ANI.jkcoxson.com/"),
+            url
+        ));
+        assert!(!stored_state_matches_server(
+            Some("https://ani.846969.xyz"),
+            url
+        ));
+    }
+
+    #[test]
+    fn state_without_a_server_marker_is_not_reused() {
+        // Everything stored by 2.3.2 and earlier: provisioned against an Android server.
+        assert!(!stored_state_matches_server(
+            None,
+            "https://ani.iloader.app"
+        ));
+        assert!(!stored_state_matches_server(
+            Some(""),
+            "https://ani.iloader.app"
+        ));
+        assert!(!stored_state_matches_server(
+            Some("  "),
+            "https://ani.iloader.app"
+        ));
+    }
+
+    #[test]
+    fn detects_minus_45061_in_server_error_message() {
+        assert!(is_incorrectly_provisioned_message(
+            "ADI error: -45061 (not provisioned)"
+        ));
+        assert!(!is_incorrectly_provisioned_message("ADI error: -45054"));
+    }
+
+    fn client_info() -> AnisetteClientInfo {
+        AnisetteClientInfo {
+            client_info: "ci".into(),
+            user_agent: "ua".into(),
+        }
+    }
+
+    fn parse(body: &str) -> AnisetteHeaders {
+        serde_json::from_str(body).unwrap()
+    }
+
+    #[test]
+    fn get_headers_minus_45061_maps_to_incorrectly_provisioned() {
+        let state = AnisetteState::new();
+        let response = headers_to_response(
+            parse(r#"{"result":"GetHeadersError","message":"ADI error: -45061"}"#),
+            &state,
+            &client_info(),
+        )
+        .expect("-45061 must not be a hard error");
+        assert!(matches!(
+            response,
+            AnisetteDataResponse::IncorrectlyProvisioned
+        ));
+    }
+
+    #[test]
+    fn other_get_headers_errors_stay_errors() {
+        let state = AnisetteState::new();
+        let result = headers_to_response(
+            parse(r#"{"result":"GetHeadersError","message":"ADI error: -45054"}"#),
+            &state,
+            &client_info(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn headers_map_to_data_for_this_state() {
+        let state = AnisetteState::new();
+        let response = headers_to_response(
+            parse(
+                r#"{"result":"Headers","X-Apple-I-MD-M":"mid","X-Apple-I-MD":"otp","X-Apple-I-MD-RINFO":"17106176"}"#,
+            ),
+            &state,
+            &client_info(),
+        )
+        .unwrap();
+        let AnisetteDataResponse::Data(data) = response else {
+            panic!("expected Data");
+        };
+        let headers = data.get_headers();
+        assert_eq!(headers["X-Apple-I-MD-M"], "mid");
+        assert_eq!(headers["X-Apple-I-MD"], "otp");
+        assert_eq!(headers["X-Mme-Device-Id"], state.get_device_id());
+        assert_eq!(data.routing_info, "17106176");
+    }
+
+    fn provisioned_state() -> AnisetteState {
+        let mut state = AnisetteState::new();
+        state.adi_pb = Some(vec![7, 7, 7]);
+        state
+    }
+
+    #[test]
+    fn saved_state_is_reloaded_for_the_same_server() {
+        let storage = InMemoryStorage::new();
+        let saved = provisioned_state();
+        save_state(&storage, "https://MAC-ANI.jkcoxson.com/", &saved).unwrap();
+        assert_eq!(
+            storage.retrieve(ANISETTE_STATE_URL_KEY).unwrap().as_deref(),
+            Some("https://mac-ani.jkcoxson.com")
+        );
+
+        let loaded = select_state(None, &storage, "https://mac-ani.jkcoxson.com", false);
+        assert_eq!(loaded.keychain_identifier, saved.keychain_identifier);
+        assert_eq!(loaded.adi_pb, saved.adi_pb);
+    }
+
+    #[test]
+    fn saved_state_from_another_server_is_not_used() {
+        let storage = InMemoryStorage::new();
+        let saved = provisioned_state();
+        save_state(&storage, "https://ani.846969.xyz", &saved).unwrap();
+
+        let loaded = select_state(None, &storage, "https://mac-ani.jkcoxson.com", false);
+        assert!(!loaded.is_provisioned());
+        assert_ne!(loaded.keychain_identifier, saved.keychain_identifier);
+    }
+
+    #[test]
+    fn saved_state_without_a_marker_is_not_used() {
+        // What 2.3.2 left behind: the state, but no anisette_state_url.
+        let storage = InMemoryStorage::new();
+        let saved = provisioned_state();
+        save_state(&storage, "https://mac-ani.jkcoxson.com", &saved).unwrap();
+        storage.delete(ANISETTE_STATE_URL_KEY).unwrap();
+
+        let loaded = select_state(None, &storage, "https://mac-ani.jkcoxson.com", false);
+        assert!(!loaded.is_provisioned());
+    }
+
+    #[test]
+    fn force_reset_discards_memory_and_storage() {
+        let storage = InMemoryStorage::new();
+        let saved = provisioned_state();
+        save_state(&storage, "https://mac-ani.jkcoxson.com", &saved).unwrap();
+
+        let fresh = select_state(
+            Some(saved.clone()),
+            &storage,
+            "https://mac-ani.jkcoxson.com",
+            true,
+        );
+        assert!(!fresh.is_provisioned());
+        assert_ne!(fresh.keychain_identifier, saved.keychain_identifier);
+    }
+
+    #[test]
+    fn state_in_memory_is_kept_without_force_reset() {
+        let storage = InMemoryStorage::new();
+        let current = provisioned_state();
+        let kept = select_state(
+            Some(current.clone()),
+            &storage,
+            "https://mac-ani.jkcoxson.com",
+            false,
+        );
+        assert_eq!(kept.keychain_identifier, current.keychain_identifier);
+        assert!(kept.is_provisioned());
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn client_info_override_is_returned_without_contacting_the_server() {
+        // Port 9 (discard) on localhost: any request would fail, so success proves none is made.
+        let override_info = AnisetteClientInfo {
+            client_info: "<Mac15,7> override".into(),
+            user_agent: "akd/1.0 CFNetwork/811.5.4".into(),
+        };
+        let mut provider = RemoteV3AnisetteProvider::new(
+            "http://127.0.0.1:9",
+            Box::new(InMemoryStorage::new()),
+            "0".into(),
+        )
+        .unwrap()
+        .set_client_info_override(Some(override_info.clone()));
+        let info = rt().block_on(provider.get_client_info()).unwrap();
+        assert_eq!(info.client_info, override_info.client_info);
+        assert_eq!(info.user_agent, override_info.user_agent);
+        assert_eq!(
+            provider.effective_client_info().unwrap().client_info,
+            override_info.client_info
+        );
+    }
+
+    #[test]
+    fn without_an_override_and_without_server_info_headers_need_provisioning() {
+        let mut provider = RemoteV3AnisetteProvider::new(
+            "http://127.0.0.1:9",
+            Box::new(InMemoryStorage::new()),
+            "0".into(),
+        )
+        .unwrap();
+        provider.state = Some(provisioned_state());
+        assert!(provider.effective_client_info().is_none());
+        let response = rt().block_on(provider.fetch_headers(None)).unwrap();
+        assert!(matches!(response, AnisetteDataResponse::NeedsProvisioning));
+    }
 }

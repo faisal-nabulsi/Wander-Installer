@@ -12,6 +12,8 @@ use crate::{SideloadError, anisette::AnisetteClientInfo, util::plist::PlistDataE
 
 const APPLE_ROOT: &[u8] = include_bytes!("./apple_root.der");
 const URL_BAG: &str = "https://gsa.apple.com/grandslam/GsService2/lookup";
+/// `X-Xcode-Version` sent on every GrandSlam request (nab138/isideload 232c7f3).
+pub const XCODE_VERSION_HEADER: &str = "27.0 (27A5218g)";
 
 pub struct GrandSlam {
     pub client: reqwest::Client,
@@ -33,6 +35,19 @@ impl GrandSlam {
             client_info,
             url_bag,
         })
+    }
+
+    /// Offline instance for unit tests: empty URL bag, never touches the network.
+    #[cfg(test)]
+    pub(crate) fn test_dummy() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            client_info: AnisetteClientInfo {
+                client_info: "test".to_string(),
+                user_agent: "test".to_string(),
+            },
+            url_bag: Dictionary::new(),
+        }
     }
 
     /// Fetch the URL bag from GrandSlam and cache it
@@ -158,7 +173,14 @@ impl GrandSlam {
             "User-Agent",
             HeaderValue::from_str(&client_info.user_agent)?,
         );
-        headers.insert("X-Xcode-Version", HeaderValue::from_static("14.2 (14C18)"));
+        // Wander 2.3.3: the half of nab138/isideload 232c7f3 that 2.3.1 did not port. 232c7f3
+        // introduced the Mac15,7 / macOS 27 client info that Wander sends, together with this
+        // matching Xcode version; upstream HEAD (326e562, shipped by iloader 2.4.1) still
+        // sends it.
+        headers.insert(
+            "X-Xcode-Version",
+            HeaderValue::from_static(XCODE_VERSION_HEADER),
+        );
         headers.insert(
             "X-Apple-App-Info",
             HeaderValue::from_static("com.apple.gs.xcode.auth"),
@@ -211,5 +233,25 @@ impl GrandSlamErrorChecker for Dictionary {
         }
 
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_headers_send_the_xcode_version_upstream_pairs_with_the_mac_client_info() {
+        let info = AnisetteClientInfo {
+            client_info: "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+                .to_string(),
+            user_agent: "akd/1.0 CFNetwork/811.5.4".to_string(),
+        };
+        for sms in [false, true] {
+            let headers = GrandSlam::base_headers(&info, sms).unwrap();
+            assert_eq!(headers.get("X-Xcode-Version").unwrap(), "27.0 (27A5218g)");
+            assert_eq!(headers.get("X-Mme-Client-Info").unwrap(), info.client_info.as_str());
+            assert_eq!(headers.get("User-Agent").unwrap(), info.user_agent.as_str());
+        }
     }
 }

@@ -7,6 +7,7 @@ import React, {
   useMemo,
 } from "react";
 import { load, Store } from "@tauri-apps/plugin-store";
+import { readInitialStoreValues } from "./anisette";
 
 export const StoreContext = createContext<{
   storeValues: { [key: string]: any };
@@ -30,13 +31,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({
   useEffect(() => {
     const initializeStore = async () => {
       const storeInstance = await load("preferences.json");
+      // Runs the one-time move to the Mac-backed anisette servers (see anisette.ts)
+      // before reading the values, so components never see the old server.
+      const values = await readInitialStoreValues(storeInstance);
       setStore(storeInstance);
-
-      const keys = await storeInstance.keys();
-      const values: { [key: string]: any } = {};
-      for (const key of keys) {
-        values[key] = await storeInstance.get(key);
-      }
       setStoreValues(values);
       setStoreInitialized(true);
     };

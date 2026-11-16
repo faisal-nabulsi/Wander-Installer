@@ -18,6 +18,7 @@ import {
   parseLinkToken,
 } from "./errors";
 import { usePlatform } from "./PlatformContext";
+import { ANISETTE_SERVER_KEY, DEFAULT_ANISETTE_SERVER } from "./anisette";
 
 export const ErrorContext = createContext<{
   err: (msg: string, err: AppError) => string;
@@ -33,8 +34,8 @@ export const ErrorProvider: React.FC<{ children: React.ReactNode }> = ({
   const [moreDetailsOpen, setMoreDetailsOpen] = useState<boolean>(false);
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [anisetteServer] = useStore<string>(
-    "anisetteServer",
-    "ani.846969.xyz",
+    ANISETTE_SERVER_KEY,
+    DEFAULT_ANISETTE_SERVER,
   );
   const { platform } = usePlatform();
 

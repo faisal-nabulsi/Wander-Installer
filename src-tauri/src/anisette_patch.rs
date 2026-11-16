@@ -1,46 +1,51 @@
-//! Apple's GrandSlam edge began returning HTTP 503 for any request whose
-//! `X-Mme-Client-Info` header names `com.apple.dt.Xcode` (started ~2026-09-10).
-//! Every public v3 anisette server still serves that blocked string from
-//! `/v3/client_info`, and isideload 0.2.22 forwards whatever the server says
-//! straight into the GrandSlam headers -- so sign-in 503s on every server.
+//! The client info Wander reports to Apple's GrandSlam sign-in service, instead of whatever
+//! the anisette server returns from `/v3/client_info`.
 //!
-//! This wrapper delegates everything to the real provider but reports the
-//! client as `akd`, the daemon that actually performs these requests on macOS.
-//! Upstream isideload made the same change on its `apple-codesign-quick` branch.
+//! History:
+//! - 2.3.1 (~2026-09-10): Apple's edge began answering HTTP 503 to any request whose
+//!   `X-Mme-Client-Info` names `com.apple.dt.Xcode`, which the public anisette servers served
+//!   at the time. Wander started reporting the client as `akd`, the macOS daemon that really
+//!   makes these requests, as upstream isideload did (232c7f3).
+//! - 2.3.3 (October 2026): Apple now refuses anisette from Android-ADI-backed servers when the
+//!   client claims to be a Mac (-80045, -80046), so the presets moved to Mac-ADI-backed servers.
+//!   Those servers report a Mac client info themselves
+//!   (`<MacBookPro13,3> <Mac OS X;10.12.6;16G29> ... (com.apple.akd/1.0)`), but iloader 2.4.1
+//!   still overrides it with the Mac15,7 string below ("just temporary while waiting for the
+//!   anisette servers to start reporting this"), so Wander does the same.
+//!
+//! The override is applied with `RemoteV3AnisetteProvider::set_client_info_override`
+//! (backport of nab138/isideload 20b06c7), so the server's `/v3/client_info` is never
+//! fetched: sign-in no longer depends on that endpoint, exactly as upstream.
 
-use std::sync::Arc;
+use isideload::anisette::AnisetteClientInfo;
 
-use isideload::{
-    anisette::{AnisetteClientInfo, AnisetteData, AnisetteProvider},
-    auth::grandslam::GrandSlam,
-};
-use rootcause::prelude::*;
-
-/// The client identifier Apple's GSA edge still accepts.
-const AKD_CLIENT_INFO: &str =
+/// The client identifier upstream (isideload 232c7f3, iloader 2.4.1) sends.
+pub const AKD_CLIENT_INFO: &str =
     "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
-const AKD_USER_AGENT: &str = "akd/1.0 CFNetwork/808.1.4";
+/// Matches iloader 2.4.1 (nab138/iloader d319ce7). The Mac servers report the same CFNetwork
+/// build plus a `Darwin/16.7.0` suffix.
+pub const AKD_USER_AGENT: &str = "akd/1.0 CFNetwork/811.5.4";
 
-pub struct AkdClientInfoProvider<P: AnisetteProvider>(pub P);
-
-#[async_trait::async_trait]
-impl<P: AnisetteProvider + Send + Sync> AnisetteProvider for AkdClientInfoProvider<P> {
-    async fn get_anisette_data(&self) -> Result<AnisetteData, Report> {
-        self.0.get_anisette_data().await
+/// The client info to pass to `set_client_info_override`.
+pub fn akd_client_info() -> AnisetteClientInfo {
+    AnisetteClientInfo {
+        client_info: AKD_CLIENT_INFO.to_string(),
+        user_agent: AKD_USER_AGENT.to_string(),
     }
+}
 
-    async fn get_client_info(&mut self) -> Result<AnisetteClientInfo, Report> {
-        Ok(AnisetteClientInfo {
-            client_info: AKD_CLIENT_INFO.to_string(),
-            user_agent: AKD_USER_AGENT.to_string(),
-        })
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    fn needs_provisioning(&self) -> Result<bool, Report> {
-        self.0.needs_provisioning()
-    }
-
-    async fn provision(&mut self, gs: Arc<GrandSlam>) -> Result<(), Report> {
-        self.0.provision(gs).await
+    #[test]
+    fn client_info_matches_upstream_2_4_1() {
+        let info = akd_client_info();
+        assert_eq!(info.user_agent, "akd/1.0 CFNetwork/811.5.4");
+        assert_eq!(
+            info.client_info,
+            "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+        );
+        assert!(!info.client_info.contains("com.apple.dt.Xcode"));
     }
 }

@@ -1,5 +1,5 @@
 use isideload::{
-    anisette::remote_v3::RemoteV3AnisetteProvider,
+    anisette::remote_v3::{ANISETTE_STATE_KEY, ANISETTE_STATE_URL_KEY, RemoteV3AnisetteProvider},
     auth::apple_account::AppleAccount,
     dev::{
         app_ids::{AppIdsApi, ListAppIdsResponse},
@@ -11,15 +11,15 @@ use isideload::{
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::time::Duration;
-use tauri::{AppHandle, Emitter, Listener, State, Window};
+use std::{path::Path, time::Duration};
+use tauri::{AppHandle, Emitter, Listener, Manager, State, Window};
 use tauri_plugin_store::StoreExt;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
-    anisette_patch::AkdClientInfoProvider,
+    anisette_patch::akd_client_info,
     error::AppError,
-    secure_storage::create_sideloading_storage,
+    secure_storage::{create_sideloading_storage, keyring_available},
     sideload::{SideloaderGuard, SideloaderMutex},
 };
 
@@ -129,29 +129,96 @@ pub fn invalidate_account(sideloader_state: State<'_, SideloaderMutex>) {
     *sideloader_guard = None;
 }
 
-#[tauri::command]
-pub fn reset_anisette_state() -> Result<bool, AppError> {
-    let state_entry = Entry::new("wander-installer", "anisette_state").map_err(|e| {
-        AppError::KeyringWithMessage(
-            "Failed to create keyring entry for anisette".into(),
-            e.to_string(),
-        )
-    })?;
+/// Anisette keys that "Reset Anisette State" removes: the provisioned state and the marker
+/// recording which server it was provisioned against.
+const ANISETTE_STORAGE_KEYS: [&str; 2] = [ANISETTE_STATE_KEY, ANISETTE_STATE_URL_KEY];
 
-    match state_entry.delete_credential() {
-        Ok(_) => {
-            debug!("Anisette state deleted from keyring.");
-            Ok(true)
+/// Delete the FsStorage copies of the anisette keys in `dir` (the app data directory).
+/// Returns whether the provisioned state file existed.
+fn delete_fs_anisette_state(dir: &Path) -> std::io::Result<bool> {
+    let mut deleted_state = false;
+    for key in ANISETTE_STORAGE_KEYS {
+        match std::fs::remove_file(dir.join(key)) {
+            Ok(()) => {
+                if key == ANISETTE_STATE_KEY {
+                    deleted_state = true;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
-        Err(keyring::Error::NoEntry) => {
-            debug!("No existing anisette state found in keyring, nothing to delete.");
-            Ok(false)
-        }
-        Err(e) => Err(AppError::KeyringWithMessage(
-            "Failed to delete anisette state".into(),
-            e.to_string(),
-        )),
     }
+    Ok(deleted_state)
+}
+
+/// Delete the keyring copies of the anisette keys. Returns whether the state entry existed.
+fn delete_keyring_anisette_state() -> Result<bool, keyring::Error> {
+    let mut deleted_state = false;
+    for key in ANISETTE_STORAGE_KEYS {
+        match Entry::new("wander-installer", key)?.delete_credential() {
+            Ok(()) => {
+                if key == ANISETTE_STATE_KEY {
+                    deleted_state = true;
+                }
+            }
+            Err(keyring::Error::NoEntry) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(deleted_state)
+}
+
+/// Remove cached anisette state. The app defaults to filesystem storage (secure_storage.rs),
+/// where the state is a file in the app data directory; before 2.3.3 this only deleted the
+/// keyring entry, so the button did nothing for most users.
+#[tauri::command]
+pub fn reset_anisette_state(handle: AppHandle) -> Result<bool, AppError> {
+    let data_dir = handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| AppError::Misc(format!("Failed to get app data directory: {:?}", e)))?;
+    // Same directory create_sideloading_storage hands to FsStorage.
+    reset_anisette_state_in(&data_dir, keyring_available(), delete_keyring_anisette_state)
+}
+
+/// Delete the anisette files in `data_dir` and, only when the keyring is the storage in use,
+/// the keyring entries. With the keyring off (the default), anisette is read from the files
+/// only, so stale keychain items are never used, and touching them could make macOS ask for
+/// the login keychain password (the reason secure_storage.rs avoids the keychain).
+fn reset_anisette_state_in(
+    data_dir: &Path,
+    keyring_in_use: bool,
+    delete_keyring: impl FnOnce() -> Result<bool, keyring::Error>,
+) -> Result<bool, AppError> {
+    let fs_deleted = delete_fs_anisette_state(data_dir).map_err(|e| {
+        AppError::Filesystem("Failed to delete anisette state file".into(), e.to_string())
+    })?;
+    if fs_deleted {
+        debug!("Anisette state file deleted.");
+    }
+    if !keyring_in_use {
+        return Ok(fs_deleted);
+    }
+
+    let keyring_deleted = match delete_keyring() {
+        Ok(deleted) => deleted,
+        // A keyring error must not hide a successful file reset.
+        Err(e) if !fs_deleted => {
+            return Err(AppError::KeyringWithMessage(
+                "Failed to delete anisette state".into(),
+                e.to_string(),
+            ));
+        }
+        Err(e) => {
+            warn!("Could not clear anisette state from keyring: {}", e);
+            false
+        }
+    };
+    if keyring_deleted {
+        debug!("Anisette state deleted from keyring.");
+    }
+
+    Ok(fs_deleted || keyring_deleted)
 }
 
 async fn login(
@@ -192,12 +259,15 @@ async fn login(
     };
 
     let mut account = AppleAccount::builder(&email.to_lowercase())
-        .anisette_provider(AkdClientInfoProvider(
+        .anisette_provider(
             RemoteV3AnisetteProvider::default()?
                 .set_serial_number("0".to_string())
                 .set_storage(create_sideloading_storage(app)?)
+                // As iloader 2.4.1 (isideload 20b06c7): report the Mac akd client info
+                // instead of the server's, without fetching /v3/client_info.
+                .set_client_info_override(Some(akd_client_info()))
                 .set_url(&anisette_url),
-        ))
+        )
         .login(password, tfa_closure)
         .await?;
 
@@ -327,4 +397,96 @@ pub async fn delete_app_id(
     dev_session.delete_app_id(&team, &app_id_id, None).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use isideload::util::{fs_storage::FsStorage, storage::SideloadingStorage};
+    use std::cell::Cell;
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wander-anisette-reset-{}-{}",
+            name,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write the state and marker exactly as the app does (FsStorage over the data dir).
+    fn store_anisette_like_the_app(dir: &std::path::Path) {
+        let storage = FsStorage::new(dir.to_path_buf());
+        storage.store_data(ANISETTE_STATE_KEY, b"<plist/>").unwrap();
+        storage
+            .store(ANISETTE_STATE_URL_KEY, "https://ani.846969.xyz")
+            .unwrap();
+        storage.store("unrelated", "keep").unwrap();
+        assert!(storage.retrieve_data(ANISETTE_STATE_KEY).unwrap().is_some());
+    }
+
+    #[test]
+    fn reset_deletes_what_fs_storage_wrote() {
+        let dir = temp_dir("fs");
+        store_anisette_like_the_app(&dir);
+
+        assert!(delete_fs_anisette_state(&dir).unwrap());
+        let storage = FsStorage::new(dir.clone());
+        assert!(storage.retrieve_data(ANISETTE_STATE_KEY).unwrap().is_none());
+        assert!(storage.retrieve(ANISETTE_STATE_URL_KEY).unwrap().is_none());
+        assert!(storage.retrieve("unrelated").unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_with_nothing_on_disk_reports_false() {
+        let dir = temp_dir("empty");
+        assert!(!delete_fs_anisette_state(&dir).unwrap());
+        // A missing data directory is not an error either.
+        assert!(!delete_fs_anisette_state(&dir.join("missing")).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_with_keyring_off_never_touches_the_keychain() {
+        let dir = temp_dir("keyring-off");
+        store_anisette_like_the_app(&dir);
+        let touched = Cell::new(false);
+        let result = reset_anisette_state_in(&dir, false, || {
+            touched.set(true);
+            Ok(true)
+        });
+        assert!(result.unwrap());
+        assert!(!touched.get(), "keychain must not be touched when the keyring is off");
+        assert!(!dir.join(ANISETTE_STATE_KEY).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_with_keyring_on_clears_both() {
+        let dir = temp_dir("keyring-on");
+        let touched = Cell::new(false);
+        let result = reset_anisette_state_in(&dir, true, || {
+            touched.set(true);
+            Ok(true)
+        });
+        assert!(result.unwrap());
+        assert!(touched.get());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keyring_error_only_fails_when_no_file_was_deleted() {
+        let dir = temp_dir("keyring-err");
+        let failing = || Err(keyring::Error::PlatformFailure("locked".into()));
+        assert!(matches!(
+            reset_anisette_state_in(&dir, true, failing),
+            Err(AppError::KeyringWithMessage(_, _))
+        ));
+        store_anisette_like_the_app(&dir);
+        assert!(reset_anisette_state_in(&dir, true, failing).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

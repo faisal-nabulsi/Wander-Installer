@@ -21,6 +21,14 @@ pub enum SideloadError {
     #[error("Failed to get anisette data, anisette not provisioned")]
     AnisetteNotProvisioned,
 
+    /// Wander 2.3.3: the anisette server kept answering -45061 after every re-provisioning
+    /// attempt (`AnisetteDataGenerator`, backport of nab138/isideload 8ca39b6). A typed variant
+    /// so the app can classify it without matching on message text.
+    #[error(
+        "Max anisette provisioning attempts reached ({0}): the anisette server keeps reporting -45061 (incorrectly provisioned)"
+    )]
+    AnisetteProvisioningExhausted(usize),
+
     #[error("Developer error {0}: {1}")]
     DeveloperError(i64, String),
 
