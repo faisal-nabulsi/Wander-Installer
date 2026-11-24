@@ -1,3 +1,4 @@
+use futures::FutureExt;
 use isideload::{
     anisette::remote_v3::{ANISETTE_STATE_KEY, ANISETTE_STATE_URL_KEY, RemoteV3AnisetteProvider},
     auth::apple_account::AppleAccount,
@@ -11,7 +12,15 @@ use isideload::{
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{path::Path, time::Duration};
+use std::{
+    panic::AssertUnwindSafe,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 use tauri::{AppHandle, Emitter, Listener, Manager, State, Window};
 use tauri_plugin_store::StoreExt;
 use tracing::{debug, warn};
@@ -221,6 +230,57 @@ fn reset_anisette_state_in(
     Ok(fs_deleted || keyring_deleted)
 }
 
+/// Set while a sign-in runs. Each sign-in asks Apple for a new trusted-device code, and a new
+/// code cancels the one before it, so a second sign-in started on top of the first (clicking
+/// Login again while "Logging in..." shows) makes the code the user types fail with -27589.
+static LOGIN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// Holds the single sign-in slot and frees it when dropped, on every return path.
+struct LoginFlight;
+
+impl LoginFlight {
+    fn acquire() -> Result<Self, AppError> {
+        LOGIN_IN_PROGRESS
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| LoginFlight)
+            .map_err(|_| AppError::LoginInProgress)
+    }
+}
+
+impl Drop for LoginFlight {
+    fn drop(&mut self) {
+        LOGIN_IN_PROGRESS.store(false, Ordering::Release);
+    }
+}
+
+/// How long the 2FA prompt waits for a code. Long enough for the "Didn't get a code?" steps
+/// in the dialog (Airplane Mode, then Settings > Sign-In & Security > Get Verification Code).
+const TWO_FACTOR_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Upper bound for the network steps of one sign-in, added up. Time spent waiting for the
+/// user to type a code is not counted (see `UserWait`), so a stalled server is given up on
+/// after this long whether or not a code was asked for, and a code typed late is never cut
+/// off. Neither HTTP client in isideload sets a request timeout, so a server that accepts the
+/// connection and never answers would otherwise hold the single sign-in slot (and keep Login
+/// disabled) until the app is quit. A normal sign-in needs about 10 seconds of network time
+/// (installer log, 2026-11-17).
+const LOGIN_NETWORK_BUDGET: Duration = Duration::from_secs(90);
+
+/// Time one sign-in has spent waiting for the user (the 2FA prompt), in milliseconds.
+#[derive(Clone, Default)]
+struct UserWait(Arc<AtomicU64>);
+
+impl UserWait {
+    fn add(&self, waited: Duration) {
+        self.0
+            .fetch_add(waited.as_millis() as u64, Ordering::AcqRel);
+    }
+
+    fn total(&self) -> Duration {
+        Duration::from_millis(self.0.load(Ordering::Acquire))
+    }
+}
+
 async fn login(
     app: &AppHandle,
     window: &Window,
@@ -228,25 +288,100 @@ async fn login(
     password: &str,
     anisette_server: String,
 ) -> Result<Sideloader, AppError> {
+    let user_wait = UserWait::default();
+    // The future does nothing until it is polled, so building it before the slot is taken
+    // starts no second sign-in.
+    single_login_with_deadline(
+        LOGIN_NETWORK_BUDGET,
+        &user_wait,
+        login_inner(app, window, email, password, anisette_server, &user_wait),
+    )
+    .await
+}
+
+/// Runs one sign-in while holding the single sign-in slot. Gives up once the sign-in has used
+/// `network_budget` of time outside `user_wait`. Dropping the timed-out future drops
+/// everything it holds, and `_flight` is released when this returns, on every path, so Login
+/// works again. A panic inside the sign-in becomes an error: Tauri sends no reply for a
+/// command that panics, and the UI would show "Logging in..." until the app is restarted.
+async fn single_login_with_deadline<T>(
+    network_budget: Duration,
+    user_wait: &UserWait,
+    sign_in: impl std::future::Future<Output = Result<T, AppError>>,
+) -> Result<T, AppError> {
+    let _flight = LoginFlight::acquire()?;
+    let started = Instant::now();
+    let sign_in = AssertUnwindSafe(sign_in).catch_unwind();
+    tokio::pin!(sign_in);
+    loop {
+        let on_network = started.elapsed().saturating_sub(user_wait.total());
+        let remaining = network_budget.saturating_sub(on_network);
+        if remaining.is_zero() {
+            warn!(
+                "Sign-in did not finish within {:?} of network time",
+                network_budget
+            );
+            return Err(AppError::LoginTimedOut);
+        }
+        // The 2FA prompt blocks inside the sign-in's poll, so the timer can only fire after
+        // it. When it does, go round again: the time the prompt took is not network time.
+        match tokio::time::timeout(remaining, &mut sign_in).await {
+            Ok(Ok(result)) => return result,
+            Ok(Err(_panic)) => {
+                // The panic text can quote what the user typed, so it is not copied into the
+                // message.
+                warn!("Sign-in panicked");
+                return Err(AppError::Misc(
+                    "The sign-in stopped because of an internal error.".into(),
+                ));
+            }
+            Err(_) => continue,
+        }
+    }
+}
+
+async fn login_inner(
+    app: &AppHandle,
+    window: &Window,
+    email: &str,
+    password: &str,
+    anisette_server: String,
+    user_wait: &UserWait,
+) -> Result<Sideloader, AppError> {
+    let user_wait = user_wait.clone();
+    let tfa_canceled = Arc::new(AtomicBool::new(false));
     let window_clone = window.clone();
+    let tfa_canceled_clone = tfa_canceled.clone();
     let tfa_closure = move || -> Option<String> {
         window_clone
             .emit("2fa-required", ())
             .expect("Failed to emit 2fa-required event");
 
-        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        // None means the user pressed Cancel in the 2FA dialog.
+        let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
+        let code_tx = tx.clone();
         let handler_id = window_clone.listen("2fa-recieved", move |event| {
             let code = event.payload();
-            let _ = tx.send(code.to_string());
+            let _ = code_tx.send(Some(code.to_string()));
+        });
+        let cancel_id = window_clone.listen("2fa-cancelled", move |_| {
+            let _ = tx.send(None);
         });
 
-        let result = rx.recv_timeout(Duration::from_secs(120));
+        let asked = Instant::now();
+        let result = rx.recv_timeout(TWO_FACTOR_TIMEOUT);
+        user_wait.add(asked.elapsed());
         window_clone.unlisten(handler_id);
+        window_clone.unlisten(cancel_id);
 
         match result {
-            Ok(code) => {
+            Ok(Some(code)) => {
                 let code = code.trim_matches('"').to_string();
                 Some(code)
+            }
+            Ok(None) => {
+                tfa_canceled_clone.store(true, Ordering::Release);
+                None
             }
             Err(_) => None,
         }
@@ -269,7 +404,14 @@ async fn login(
                 .set_url(&anisette_url),
         )
         .login(password, tfa_closure)
-        .await?;
+        .await
+        .map_err(|e| {
+            if tfa_canceled.load(Ordering::Acquire) {
+                AppError::Canceled("Sign-in".into())
+            } else {
+                AppError::from(e)
+            }
+        })?;
 
     debug!("Logged in");
 
@@ -404,6 +546,147 @@ mod tests {
     use super::*;
     use isideload::util::{fs_storage::FsStorage, storage::SideloadingStorage};
     use std::cell::Cell;
+
+    /// The sign-in slot is one static, so the tests that take it must not run side by side.
+    static SLOT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn run<F: std::future::Future>(f: F) -> F::Output {
+        let _serial = SLOT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    async fn slot_is_free() -> bool {
+        single_login_with_deadline(Duration::from_secs(5), &UserWait::default(), async {
+            Ok(())
+        })
+        .await
+        .is_ok()
+    }
+
+    #[test]
+    fn stalled_sign_in_times_out_and_frees_the_slot() {
+        run(async {
+            // A server that accepts the connection and never answers.
+            let stalled = std::future::pending::<Result<(), AppError>>();
+            let started = Instant::now();
+            let result = single_login_with_deadline(
+                Duration::from_millis(50),
+                &UserWait::default(),
+                stalled,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(AppError::LoginTimedOut)),
+                "{:?}",
+                result
+            );
+            assert!(started.elapsed() < Duration::from_secs(2));
+            // Login is usable again: the slot was released.
+            assert!(slot_is_free().await);
+        });
+    }
+
+    /// Stands in for the 2FA prompt: blocks the poll, as `tfa_closure` does, and records the
+    /// wait.
+    fn user_types_a_code(user_wait: &UserWait, takes: Duration) {
+        let asked = Instant::now();
+        std::thread::sleep(takes);
+        user_wait.add(asked.elapsed());
+    }
+
+    #[test]
+    fn time_spent_typing_codes_is_not_network_time() {
+        run(async {
+            let user_wait = UserWait::default();
+            let prompts = user_wait.clone();
+            // Two code prompts, each far longer than the whole network budget, with a short
+            // network step after each one.
+            let sign_in = async move {
+                for _ in 0..2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    user_types_a_code(&prompts, Duration::from_millis(300));
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok(7)
+            };
+            let result =
+                single_login_with_deadline(Duration::from_millis(150), &user_wait, sign_in).await;
+            assert!(matches!(result, Ok(7)), "{:?}", result);
+        });
+    }
+
+    #[test]
+    fn a_stall_after_the_code_still_times_out() {
+        run(async {
+            let user_wait = UserWait::default();
+            let prompts = user_wait.clone();
+            let sign_in = async move {
+                user_types_a_code(&prompts, Duration::from_millis(300));
+                std::future::pending::<Result<(), AppError>>().await
+            };
+            let started = Instant::now();
+            let result =
+                single_login_with_deadline(Duration::from_millis(100), &user_wait, sign_in).await;
+            assert!(
+                matches!(result, Err(AppError::LoginTimedOut)),
+                "{:?}",
+                result
+            );
+            // The code wait plus the network budget, not more.
+            let took = started.elapsed();
+            assert!(took >= Duration::from_millis(400), "{:?}", took);
+            assert!(took < Duration::from_secs(2), "{:?}", took);
+            assert!(slot_is_free().await);
+        });
+    }
+
+    #[test]
+    fn a_panic_in_the_sign_in_becomes_an_error_and_frees_the_slot() {
+        run(async {
+            let sign_in = async {
+                if true {
+                    panic!("test panic: the sign-in future blew up");
+                }
+                Ok(())
+            };
+            let result =
+                single_login_with_deadline(Duration::from_secs(5), &UserWait::default(), sign_in)
+                    .await;
+            match result {
+                // The panic text must not reach the user: it can quote what they typed.
+                Err(AppError::Misc(message)) => assert!(!message.contains("test panic")),
+                other => panic!("expected a misc error, got {:?}", other),
+            }
+            assert!(slot_is_free().await);
+        });
+    }
+
+    #[test]
+    fn a_second_sign_in_is_refused_while_one_runs() {
+        run(async {
+            let first =
+                single_login_with_deadline(Duration::from_secs(5), &UserWait::default(), async {
+                    let second = single_login_with_deadline(
+                        Duration::from_secs(5),
+                        &UserWait::default(),
+                        async { Ok(()) },
+                    )
+                    .await;
+                    assert!(
+                        matches!(second, Err(AppError::LoginInProgress)),
+                        "{:?}",
+                        second
+                    );
+                    Ok(())
+                })
+                .await;
+            assert!(first.is_ok(), "{:?}", first);
+        });
+    }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(

@@ -12,6 +12,10 @@ pub enum AppError {
     #[error("{0}")]
     NotEnoughAppIds(String),
     #[error("{0}")]
+    AppleIdBlocked(String),
+    #[error("{0}")]
+    SigningIdentityRejected(String),
+    #[error("{0}")]
     DeviceComs(String),
     #[error("{0}")]
     Underage(String),
@@ -21,6 +25,12 @@ pub enum AppError {
     Developer(String),
     #[error("{0}")]
     Auth(String),
+    #[error("{0}")]
+    TwoFactorRejected(String),
+    #[error("A sign-in is already in progress")]
+    LoginInProgress,
+    #[error("Sign-in timed out")]
+    LoginTimedOut,
     #[error("{0}")]
     Download(String),
     #[error("{0}: {1}")]
@@ -83,10 +93,54 @@ pub fn is_anisette_rejected_code(code: i64) -> bool {
     ANISETTE_REJECTED_CODES.contains(&code)
 }
 
+/// Sign-in error code Apple returned once, on 2026-11-17, right after a trusted-device code
+/// was typed. Apple does not document it. Observed once, while several sign-ins were running
+/// at the same time; the likely cause is a code from an earlier attempt, not a confirmed one.
+/// The installer log from that session has no line with the `ec`/`em` values (the error was
+/// only read off the UI), so this mapping rests on that single observation.
+pub const TWO_FACTOR_REJECTED_CODE: i64 = -27589;
+
+/// Context isideload adds when Apple's answer to a submitted trusted-device code is an error
+/// (`verify_trusted_device_2fa`). -27589 only means "code rejected" under this context; from
+/// any other step (for example the password step) it stays a generic auth error.
+const TWO_FACTOR_SUBMIT_CONTEXT: &str = "Trusted device 2FA rejected";
+
+/// The two ways a device reports, at install time, that Apple refuses apps signed by this
+/// Apple ID. Signing has already succeeded when either appears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppleInstallBlock {
+    /// `0xe8008024 (The provisioning profile is banned.)`: Apple has blocked the Apple ID's
+    /// signing team. First reported in July 2026; nothing a signer controls (certificate, key,
+    /// bundle ID, profile) gets past it, and the same account fails in other sideloading tools.
+    AppleIdBlocked,
+    /// `0xe8008018 (The identity used to sign the executable is no longer valid.)`: the same
+    /// block as seen by older iOS versions, or an ordinary revoked certificate. The text does
+    /// not say which, so the advice covers both.
+    SigningIdentityRejected,
+}
+
+/// Recognises Apple's install-time block in an error text, by hex code or by phrase, ignoring
+/// case. The banned-profile code wins when a text holds both, because it is the specific one.
+pub fn apple_install_block(text: &str) -> Option<AppleInstallBlock> {
+    let text = text.to_lowercase();
+    if text.contains("0xe8008024") || text.contains("the provisioning profile is banned") {
+        return Some(AppleInstallBlock::AppleIdBlocked);
+    }
+    if text.contains("0xe8008018")
+        || text.contains("the identity used to sign the executable is no longer valid")
+    {
+        return Some(AppleInstallBlock::SigningIdentityRejected);
+    }
+    None
+}
+
 // from rootcause report
 impl From<Report> for AppError {
     fn from(report: Report) -> Self {
         let report_str = report.to_string();
+        let at_two_factor_submit = report
+            .iter_reports()
+            .any(|cause| cause.to_string().contains(TWO_FACTOR_SUBMIT_CONTEXT));
 
         // Apple's GrandSlam sign-in edge (gsa.apple.com) can turn the request away before it
         // ever looks at the credentials: since ~2026-09-10 it answers a POST whose
@@ -133,6 +187,9 @@ impl From<Report> for AppError {
                 match err {
                     &SideloadError::AuthWithMessage(code, _) => match code {
                         -20209 => return AppError::AccountLocked(report_str),
+                        TWO_FACTOR_REJECTED_CODE if at_two_factor_submit => {
+                            return AppError::TwoFactorRejected(report_str);
+                        }
                         code if is_anisette_rejected_code(code) => {
                             return AppError::AnisetteRejected(report_str);
                         }
@@ -172,7 +229,16 @@ impl From<Report> for AppError {
             }
         }
 
-        AppError::Misc(report_str)
+        // Apple's install-time refusal of this Apple ID. Matched on the whole report text, so
+        // it is found whichever error shape carries the device's message. Last, so it cannot
+        // claim a report that one of the matches above recognises.
+        match apple_install_block(&report_str) {
+            Some(AppleInstallBlock::AppleIdBlocked) => AppError::AppleIdBlocked(report_str),
+            Some(AppleInstallBlock::SigningIdentityRejected) => {
+                AppError::SigningIdentityRejected(report_str)
+            }
+            None => AppError::Misc(report_str),
+        }
     }
 }
 
@@ -218,6 +284,151 @@ mod tests {
                 "bad password".into()
             )),
             AppError::Auth(_)
+        ));
+    }
+
+    #[test]
+    fn rejected_two_factor_code_gets_its_own_error() {
+        // The message is a placeholder: Apple's `em` text for -27589 was not captured.
+        let report: Report = report!(SideloadError::AuthWithMessage(
+            -27589,
+            "placeholder message".into()
+        ))
+        .context("Trusted device 2FA rejected")
+        .context("Failed to log in to Apple ID")
+        .into_dynamic();
+        let err = AppError::from(report);
+        assert!(matches!(err, AppError::TwoFactorRejected(_)), "{:?}", err);
+        assert_eq!(err.as_ref(), "two_factor_rejected");
+    }
+
+    #[test]
+    fn minus_27589_outside_the_code_submission_stays_auth() {
+        // Same code, but from the password step: the user typed no code, so "Apple rejected
+        // the code" would be wrong.
+        let err = classify(SideloadError::AuthWithMessage(
+            -27589,
+            "Unknown error".into(),
+        ));
+        assert!(matches!(err, AppError::Auth(_)), "{:?}", err);
+    }
+
+    #[test]
+    fn login_in_progress_serializes_with_its_own_type() {
+        assert_eq!(AppError::LoginInProgress.as_ref(), "login_in_progress");
+        assert_eq!(AppError::LoginTimedOut.as_ref(), "login_timed_out");
+    }
+
+    // The device's wording, as quoted in nab138/iloader issue 583 (the staging path is the
+    // one from that report).
+    const BANNED_PROFILE_TEXT: &str = "Failed to verify code signature of /var/installd/Library/Caches/com.apple.mobile.installd.staging/temp.KpAV22/extracted/LiveContainer.app : 0xe8008024 (The provisioning profile is banned.)";
+    const INVALID_IDENTITY_TEXT: &str = "Failed to verify code signature of /var/installd/Library/Caches/com.apple.mobile.installd.staging/temp.KpAV22/extracted/LiveContainer.app : 0xe8008018 (The identity used to sign the executable is no longer valid.)";
+
+    /// The report `Sideloader::install_app` returns when the device refuses the install.
+    fn install_failure(device_text: &str) -> AppError {
+        let report: Report = report!(SideloadError::IdeviceError(
+            IdeviceError::ApplicationVerificationFailed(device_text.into())
+        ))
+        .context("Failed to install app on device")
+        .into_dynamic();
+        AppError::from(report)
+    }
+
+    #[test]
+    fn install_block_matches_the_hex_code_or_the_phrase() {
+        use AppleInstallBlock::*;
+        // Hard-coded on purpose, so a changed needle in the matcher fails here.
+        let cases = [
+            (BANNED_PROFILE_TEXT, Some(AppleIdBlocked)),
+            ("status 0xe8008024", Some(AppleIdBlocked)),
+            ("The provisioning profile is banned.", Some(AppleIdBlocked)),
+            (INVALID_IDENTITY_TEXT, Some(SigningIdentityRejected)),
+            ("status 0xe8008018", Some(SigningIdentityRejected)),
+            (
+                "The identity used to sign the executable is no longer valid.",
+                Some(SigningIdentityRejected),
+            ),
+            // A text with both is the banned profile.
+            ("0xe8008018, then 0xe8008024", Some(AppleIdBlocked)),
+            // Neighbouring codes and other verification failures are not the block.
+            (
+                "0xe8008015 (A valid provisioning profile for this executable was not found.)",
+                None,
+            ),
+            ("0xe800801c (No code signature found.)", None),
+            (
+                "This device has reached the maximum number of installed apps",
+                None,
+            ),
+            ("e8008024", None),
+            ("", None),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(apple_install_block(text), expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn install_block_matching_ignores_case() {
+        use AppleInstallBlock::*;
+        assert_eq!(apple_install_block("0XE8008024"), Some(AppleIdBlocked));
+        assert_eq!(
+            apple_install_block("THE PROVISIONING PROFILE IS BANNED"),
+            Some(AppleIdBlocked)
+        );
+        assert_eq!(
+            apple_install_block("0xE8008018"),
+            Some(SigningIdentityRejected)
+        );
+        assert_eq!(
+            apple_install_block("the Identity Used To Sign The Executable Is No Longer Valid"),
+            Some(SigningIdentityRejected)
+        );
+    }
+
+    #[test]
+    fn banned_profile_at_install_is_apple_id_blocked() {
+        let err = install_failure(BANNED_PROFILE_TEXT);
+        assert!(matches!(err, AppError::AppleIdBlocked(_)), "{:?}", err);
+        assert_eq!(err.as_ref(), "apple_id_blocked");
+        // The device's own text stays in the message for "More details" and support.
+        assert!(err.to_string().contains("0xe8008024"), "{err}");
+    }
+
+    #[test]
+    fn invalid_identity_at_install_is_signing_identity_rejected() {
+        let err = install_failure(INVALID_IDENTITY_TEXT);
+        assert!(
+            matches!(err, AppError::SigningIdentityRejected(_)),
+            "{:?}",
+            err
+        );
+        assert_eq!(err.as_ref(), "signing_identity_rejected");
+        assert!(err.to_string().contains("0xe8008018"), "{err}");
+    }
+
+    #[test]
+    fn install_block_is_found_outside_the_typed_install_error() {
+        // The same device text arriving as plain text, not as ApplicationVerificationFailed.
+        let report: Report =
+            report!("installd said: 0xE8008024 (the provisioning profile is banned.)")
+                .context("Failed to install app on device")
+                .into_dynamic();
+        let err = AppError::from(report);
+        assert!(matches!(err, AppError::AppleIdBlocked(_)), "{:?}", err);
+    }
+
+    #[test]
+    fn other_install_failures_keep_their_mapping() {
+        assert!(matches!(
+            install_failure("This device has reached the maximum number of installed apps"),
+            AppError::MaxApps(_)
+        ));
+        assert!(matches!(
+            install_failure(
+                "0xe8008015 (A valid provisioning profile for this executable was not found.)"
+            ),
+            AppError::Misc(_)
         ));
     }
 

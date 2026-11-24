@@ -946,17 +946,16 @@ fn censor_email(email: &str) -> String {
     if std::env::var("DEBUG_SENSITIVE").is_ok() {
         return email.to_string();
     }
+    // By character, not by byte: slicing bytes panicked on an empty local part ("@x.com")
+    // and on a first or last letter that is not ASCII, and login() calls this first.
     if let Some(at_pos) = email.find('@') {
         let (local, domain) = email.split_at(at_pos);
-        if local.len() <= 2 {
-            format!("{}***{}", &local[0..1], &domain)
-        } else {
-            format!(
-                "{}***{}{}",
-                &local[0..1],
-                &local[local.len() - 1..],
-                &domain
-            )
+        let mut chars = local.chars();
+        let first = chars.next().map(String::from).unwrap_or_default();
+        match (chars.next_back(), chars.next_back()) {
+            // Three or more characters: show the first and the last.
+            (Some(last), Some(_)) => format!("{}***{}{}", first, last, domain),
+            _ => format!("{}***{}", first, domain),
         }
     } else {
         "***".to_string()
@@ -966,6 +965,33 @@ fn censor_email(email: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn censor_email_keeps_its_output_and_never_panics() {
+        if std::env::var("DEBUG_SENSITIVE").is_ok() {
+            return;
+        }
+        // Unchanged for ordinary addresses.
+        assert_eq!(censor_email("jane.doe@example.com"), "j***e@example.com");
+        assert_eq!(censor_email("abc@example.com"), "a***c@example.com");
+        assert_eq!(censor_email("ab@example.com"), "a***@example.com");
+        assert_eq!(censor_email("a@example.com"), "a***@example.com");
+        assert_eq!(censor_email("no-at-sign"), "***");
+        // These panicked before (byte slicing).
+        assert_eq!(censor_email("@example.com"), "***@example.com");
+        assert_eq!(
+            censor_email("\u{44f}@example.com"),
+            "\u{44f}***@example.com"
+        );
+        assert_eq!(
+            censor_email("\u{44f}\u{43d}\u{430}@example.com"),
+            "\u{44f}***\u{430}@example.com"
+        );
+        assert_eq!(
+            censor_email("jos\u{e9}@example.com"),
+            "j***\u{e9}@example.com"
+        );
+    }
 
     fn status(entries: Vec<(&str, plist::Value)>) -> Dictionary {
         let mut d = Dictionary::new();

@@ -75,6 +75,15 @@
     "verification_placeholder": "Verification Code...",
     "valid_6digit": "Please enter a valid 6-digit code.",
     "submit": "Submit",
+    "two_factor_help_toggle": "Didn't get a code?",
+    "two_factor_help_scope": "If your trusted device is an iPhone:",
+    "two_factor_help_step_airplane": "On your iPhone, turn on Airplane Mode. Make sure Wi-Fi is off too.",
+    "two_factor_help_step_settings": "Open Settings > your name > Sign-In & Security.",
+    "two_factor_help_step_get_code": "In the Account Details Unavailable pop-up, tap Get Verification Code.",
+    "two_factor_help_step_type_code": "Type the code here, then turn Airplane Mode off.",
+    "two_factor_help_dont_retry": "Don't press Login again while you wait — each new attempt cancels the earlier code.",
+    "two_factor_help_sms": "If you get codes by text message, wait a minute and check Messages.",
+    "login_canceled": "Sign-in canceled.",
     "max_certs_title": "Maximum certificates reached",
     "max_certs_desc": "Wander will revoke your existing certificates and generate a new one.",
     "hide_certificate_list": "Hide certificate list",
@@ -264,6 +273,16 @@
         "Sign in again. Wander Installer sets up a fresh identity on its own, and that sometimes needs one more try.",
         "If it keeps happening, open Settings, choose a different Anisette Server, and sign in again."
       ],
+      "two_factor_rejected": [
+        "Apple rejected the code. Close this, click Login once, and enter a fresh code."
+      ],
+      "login_in_progress": [
+        "A sign-in is already running. Wait for it to finish before you click Login again. It ends on its own after a few minutes."
+      ],
+      "login_timed_out": [
+        "The sign-in did not finish in time. Click Login again.",
+        "If it keeps happening, check any VPN, firewall or network filter on this computer."
+      ],
       "apple_rate_limited": [
         "Apple is limiting sign-in attempts from your network right now. Your Apple ID and password are not the problem.",
         "Wait a minute or two, then sign in once. Trying again straight away keeps the limit in place.",
@@ -296,6 +315,16 @@
         "You can only have 3 sideloaded apps installed at a time with a free Apple ID.",
         "Delete other sideloaded apps to free up space for this one.",
         "Expired apps still count towards the 3 app limit."
+      ],
+      "apple_id_blocked": [
+        "Apple is refusing apps signed with this Apple ID on this device. This happens on Apple's side, and people using other sideloading tools report it too. Wander cannot fix it.",
+        "Sign out and try a different Apple ID.",
+        "More about this error: ((link:https://wanderspoofer.com/help/install-errors/#apple-id-blocked))"
+      ],
+      "signing_identity_rejected": [
+        "Apple no longer accepts the certificate that signed this app.",
+        "Click Install Wander again. If it repeats, try a different Apple ID.",
+        "More about this error: ((link:https://wanderspoofer.com/help/install-errors/#apple-id-blocked))"
       ]
     },
     "support_message": "If the issue persists, press \"Copy to clipboard\" and send the copied error to the <discord>Discord</discord> or a <github>GitHub issue</github> for support."

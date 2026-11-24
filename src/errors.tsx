@@ -5,6 +5,9 @@ export const errorSuggestionKeys = {
   account_locked: ["error.suggestions.account_locked"],
   developer: [],
   auth: ["error.suggestions.auth"],
+  two_factor_rejected: ["error.suggestions.two_factor_rejected"],
+  login_in_progress: ["error.suggestions.login_in_progress"],
+  login_timed_out: ["error.suggestions.login_timed_out"],
   download: ["error.suggestions.download"],
   house_arrest: [
     "error.suggestions.house_arrest",
@@ -45,6 +48,8 @@ export const errorSuggestionKeys = {
   filesystem: ["error.suggestions.filesystem", "error.suggestions.admin"],
   not_enough_app_ids: ["error.suggestions.not_enough_app_ids"],
   max_apps: ["error.suggestions.max_apps"],
+  apple_id_blocked: ["error.suggestions.apple_id_blocked"],
+  signing_identity_rejected: ["error.suggestions.signing_identity_rejected"],
 } as const;
 
 export type ErrorVariant = keyof typeof errorSuggestionKeys;

@@ -10,6 +10,7 @@ import { useError } from "./ErrorContext";
 import { Certificate } from "./pages/Certificates";
 import { useTranslation } from "react-i18next";
 import { ANISETTE_SERVER_KEY, DEFAULT_ANISETTE_SERVER } from "./anisette";
+import { AppError } from "./errors";
 
 const storePromise = load("data.json");
 
@@ -38,7 +39,49 @@ export const AppleID = ({
   const [certs, setCerts] = useState<Certificate[] | null>(null);
   const [selectedSerials, setSelectedSerials] = useState<string[]>([]);
   const [chooseCertsOpen, setChooseCertsOpen] = useState<boolean>(false);
+  const [tfaHelpOpen, setTfaHelpOpen] = useState<boolean>(false);
+  // Only one sign-in at a time: every new attempt makes Apple send a new code, which cancels
+  // the code from the attempt before it. The ref blocks a second call made before the next
+  // render (a double click, or Enter right after a click); the state drives the UI.
+  const loginInFlight = useRef<boolean>(false);
+  const [loggingIn, setLoggingIn] = useState<boolean>(false);
   const { err } = useError();
+
+  const closeTfa = () => {
+    setTfaOpen(false);
+    setTfaCode("");
+    setTfaHelpOpen(false);
+  };
+
+  const runLogin = (signIn: () => Promise<void>) => {
+    if (loginInFlight.current) return;
+    loginInFlight.current = true;
+    setLoggingIn(true);
+    const promise = async () => {
+      try {
+        await signIn();
+        setForceUpdateIds((v) => v + 1);
+        closeTfa();
+      } catch (e) {
+        // "login_in_progress" means another sign-in still owns the 2FA dialog: leave it open.
+        if ((e as AppError | undefined)?.type !== "login_in_progress") {
+          closeTfa();
+        }
+        throw e;
+      } finally {
+        loginInFlight.current = false;
+        setLoggingIn(false);
+      }
+    };
+    toast.promise(promise, {
+      loading: t("apple_id.logging_in"),
+      success: t("apple_id.logged_in_success"),
+      error: (e: AppError) =>
+        e?.type === "canceled"
+          ? t("apple_id.login_canceled")
+          : err(t("apple_id.login_failed"), e),
+    });
+  };
 
   useEffect(() => {
     let getLoggedInAs = async () => {
@@ -61,6 +104,13 @@ export const AppleID = ({
 
   const listenerAdded = useRef<boolean>(false);
   const unlisten = useRef<() => void>(() => {});
+
+  // A reload (F5, or HMR in dev) can leave a sign-in waiting for a code in a dialog that no
+  // longer exists, while it still holds the single sign-in slot. Tell it to stop. With no
+  // sign-in waiting for a code this does nothing.
+  useEffect(() => {
+    emit("2fa-cancelled").catch(() => {});
+  }, []);
 
   useEffect(() => {
     if (!listenerAdded.current) {
@@ -141,18 +191,13 @@ export const AppleID = ({
                       <button
                         type="button"
                         className="action-button primary"
+                        disabled={loggingIn}
                         onClick={() => {
-                          let promise = async () => {
+                          runLogin(async () => {
                             await invoke("login_stored", {
                               email: id,
                               anisetteServer,
                             });
-                            setForceUpdateIds((v) => v + 1);
-                          };
-                          toast.promise(promise, {
-                            loading: t("apple_id.logging_in"),
-                            success: t("apple_id.logged_in_success"),
-                            error: (e) => err(t("apple_id.login_failed"), e),
                           });
                         }}
                       >
@@ -200,6 +245,7 @@ export const AppleID = ({
               className="credentials"
               onSubmit={async (e) => {
                 e.preventDefault();
+                if (loginInFlight.current) return;
                 if (!emailInput || !passwordInput) {
                   toast.warning(t("apple_id.enter_email_password"));
                   return;
@@ -208,19 +254,13 @@ export const AppleID = ({
                 //   toast.warning(t("apple_id.valid_email"));
                 //   return;
                 // }
-                let promise = async () => {
+                runLogin(async () => {
                   await invoke("login_new", {
                     email: emailInput,
                     password: passwordInput,
                     saveCredentials: saveCredentials,
                     anisetteServer,
                   });
-                  setForceUpdateIds((v) => v + 1);
-                };
-                toast.promise(promise, {
-                  loading: t("apple_id.logging_in"),
-                  success: t("apple_id.logged_in_success"),
-                  error: (e) => err(t("apple_id.login_failed"), e),
                 });
               }}
             >
@@ -253,9 +293,12 @@ export const AppleID = ({
                   </label>
                 </div>
               )}
-              <button type="submit">{t("apple_id.login")}</button>
+              <button type="submit" disabled={loggingIn} aria-busy={loggingIn}>
+                {loggingIn ? t("apple_id.logging_in") : t("apple_id.login")}
+              </button>
               {addAccountOpen && storedIds.length > 0 && (
                 <button
+                  type="button"
                   onClick={() => {
                     setAddAccountOpen(false);
                   }}
@@ -290,7 +333,47 @@ export const AppleID = ({
             style={{ marginRight: "0.5em" }}
           />
           <button type="submit">{t("apple_id.submit")}</button>
+          <button
+            type="button"
+            className="tfa-cancel"
+            onClick={async () => {
+              await emit("2fa-cancelled");
+              closeTfa();
+            }}
+          >
+            {t("common.cancel")}
+          </button>
         </form>
+        <p
+          className="tfa-help-toggle"
+          role="button"
+          tabIndex={0}
+          aria-expanded={tfaHelpOpen}
+          onClick={() => setTfaHelpOpen((v) => !v)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              setTfaHelpOpen((v) => !v);
+            }
+          }}
+        >
+          {t("apple_id.two_factor_help_toggle")} {tfaHelpOpen ? "▲" : "▼"}
+        </p>
+        {tfaHelpOpen && (
+          <div className="tfa-help">
+            <p>{t("apple_id.two_factor_help_scope")}</p>
+            <ol>
+              <li>{t("apple_id.two_factor_help_step_airplane")}</li>
+              <li>{t("apple_id.two_factor_help_step_settings")}</li>
+              <li>{t("apple_id.two_factor_help_step_get_code")}</li>
+              <li>{t("apple_id.two_factor_help_step_type_code")}</li>
+            </ol>
+            <p>{t("apple_id.two_factor_help_sms")}</p>
+            <p className="tfa-help-warning">
+              {t("apple_id.two_factor_help_dont_retry")}
+            </p>
+          </div>
+        )}
       </Modal>
       <Modal sizeFit isOpen={certs !== null} zIndex={2000}>
         <h2 className="cert-header">{t("apple_id.max_certs_title")}</h2>
