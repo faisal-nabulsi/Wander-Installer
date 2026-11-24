@@ -4,8 +4,38 @@ Makes Apple ID sign-in harder to break by accident, and explains two install fai
 come from Apple's side. Based on released 2.3.3 (f417bdc). isideload stays at the vendored
 0.2.22; one small function in it is fixed (section 7).
 
-Nothing here was tested against Apple's servers or on a device. The new behaviour is covered
+Apart from the header check in section 0, nothing here was tested against Apple's servers or on a device. The new behaviour is covered
 by unit tests only. No sign-in and no install was run with the 2.3.4 build.
+
+## 0. Apple ID sign-in works again (HTTP 503 since about 2026-11-19)
+
+Since about 2026-11-19 Apple's sign-in server (gsa.apple.com) answers HTTP 503 to any request
+whose `X-Mme-Client-Info` contains `<macOS;`. Released 2.3.3 sends exactly that
+(`<Mac15,7> <macOS;27.0;26A5378j> ...`), so new sign-ins fail before the password is checked.
+Checked on 2026-11-23 with a junk request and no account: that header gets 503, the same header
+spelled `Mac OS X` gets past the gate (401/404). Reports: SideStore#1745, AltStore#1875,
+nab138/iloader#1203, #1205, #1304.
+
+- `src-tauri/src/anisette_patch.rs`: the client info is now the current identity
+  `<MacBookAir10,1> <Mac OS X;27.3;26C5035r> <com.apple.AuthKit/1 (com.apple.akd/1.0)>` with
+  the matching user agent `akd/1.0 CFNetwork/3896.300.31 Darwin/27.3.0`, the pair reported in
+  iloader#1203 to sign in and install end to end, including 2FA and Advanced Data Protection
+  accounts. Upstream iloader 2.4.2 instead went back to the 10.12.6 identity, which passes the
+  503 but is refused later for many accounts (-22410, -23782, 403 on trusted phone numbers).
+- `src-tauri/src/account.rs`: anisette state provisioned under the old identity makes the first
+  sign-in fail with -22410 (iloader#1304). Before each sign-in the Installer compares the file
+  `anisette_identity` in its data directory with the current identity; if it differs or is
+  missing, it clears the saved anisette state once (the same thing "Reset Anisette State"
+  does) and records the new identity (client info and user agent). The marker is opened for
+  writing before anything is cleared, so a marker that cannot be written never causes a clear.
+  It never blocks a sign-in. **Support note:** because the device identity changed, the first
+  sign-in after updating asks for a 2FA code again, including for saved accounts.
+- Tests: `anisette_patch::tests::client_info_is_a_current_mac_os_x_identity`,
+  `account::tests::identity_change_clears_old_state_once`,
+  `identity_marker_on_a_fresh_install_just_records_the_identity`,
+  `identity_check_with_keyring_off_never_touches_the_keychain`,
+  `identity_marker_that_is_not_text_counts_as_a_mismatch`,
+  `identity_marker_that_cannot_be_written_never_clears_state`.
 
 ## 1. One sign-in at a time
 

@@ -13,18 +13,30 @@
 //!   still overrides it with the Mac15,7 string below ("just temporary while waiting for the
 //!   anisette servers to start reporting this"), so Wander does the same.
 //!
+//! - 2.3.4 (2026-11-23): since about 2026-11-19 gsa.apple.com answers HTTP 503 to any
+//!   `X-Mme-Client-Info` containing `<macOS;` (SideStore#1745, AltStore#1875). It must say
+//!   `Mac OS X`, as Apple's own frameworks do. iloader 2.4.2 went back to the 10.12.6 identity,
+//!   which passes the 503 but is refused later for many accounts (-22410, -23782, 403 on the
+//!   trusted phone numbers; iloader#1204, #1199, #1197). Wander uses the current identity and
+//!   matching user agent that iloader#1203 / #1205 report signing in and installing end to end,
+//!   including 2FA and Advanced Data Protection accounts. Anisette state provisioned under the
+//!   old identity makes the first sign-in fail with -22410 (iloader#1304), so `account.rs`
+//!   clears it once when this identity changes (see `IDENTITY_MARKER_FILE`).
+//!
 //! The override is applied with `RemoteV3AnisetteProvider::set_client_info_override`
 //! (backport of nab138/isideload 20b06c7), so the server's `/v3/client_info` is never
 //! fetched: sign-in no longer depends on that endpoint, exactly as upstream.
 
 use isideload::anisette::AnisetteClientInfo;
 
-/// The client identifier upstream (isideload 232c7f3, iloader 2.4.1) sends.
+/// A current macOS akd identity, spelled `Mac OS X` (the `macOS;` spelling gets HTTP 503).
+/// Pair verified end to end in nab138/iloader#1203 and proposed in #1205.
 pub const AKD_CLIENT_INFO: &str =
-    "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
-/// Matches iloader 2.4.1 (nab138/iloader d319ce7). The Mac servers report the same CFNetwork
-/// build plus a `Darwin/16.7.0` suffix.
-pub const AKD_USER_AGENT: &str = "akd/1.0 CFNetwork/811.5.4";
+    "<MacBookAir10,1> <Mac OS X;27.3;26C5035r> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
+/// The user agent sent with `AKD_CLIENT_INFO` in the build iloader#1203 verified end to end.
+/// (SideStore#1745 found the user agent does not affect the 503; AltStore#1851 reports 503s with
+/// mismatched pairs, so keep the verified pair together.)
+pub const AKD_USER_AGENT: &str = "akd/1.0 CFNetwork/3896.300.31 Darwin/27.3.0";
 
 /// The client info to pass to `set_client_info_override`.
 pub fn akd_client_info() -> AnisetteClientInfo {
@@ -39,13 +51,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn client_info_matches_upstream_2_4_1() {
+    fn client_info_is_a_current_mac_os_x_identity() {
         let info = akd_client_info();
-        assert_eq!(info.user_agent, "akd/1.0 CFNetwork/811.5.4");
+        assert_eq!(
+            info.user_agent,
+            "akd/1.0 CFNetwork/3896.300.31 Darwin/27.3.0"
+        );
         assert_eq!(
             info.client_info,
-            "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+            "<MacBookAir10,1> <Mac OS X;27.3;26C5035r> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
         );
+        // gsa.apple.com answers 503 to `macOS;` (since ~2026-11-19) and to `com.apple.dt.Xcode`.
+        assert!(!info.client_info.contains("macOS;"));
+        assert!(info.client_info.contains("<Mac OS X;"));
         assert!(!info.client_info.contains("com.apple.dt.Xcode"));
+        assert!(info.client_info.contains("(com.apple.akd/1.0)"));
     }
 }

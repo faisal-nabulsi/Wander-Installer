@@ -26,7 +26,7 @@ use tauri_plugin_store::StoreExt;
 use tracing::{debug, warn};
 
 use crate::{
-    anisette_patch::akd_client_info,
+    anisette_patch::{AKD_CLIENT_INFO, AKD_USER_AGENT, akd_client_info},
     error::AppError,
     secure_storage::{create_sideloading_storage, keyring_available},
     sideload::{SideloaderGuard, SideloaderMutex},
@@ -230,6 +230,74 @@ fn reset_anisette_state_in(
     Ok(fs_deleted || keyring_deleted)
 }
 
+/// File in the app data directory that records which client identity (`AKD_CLIENT_INFO` and
+/// `AKD_USER_AGENT`) the saved anisette state was provisioned under. State provisioned under an
+/// older identity makes Apple refuse the first sign-in with -22410 (nab138/iloader#1304), so it
+/// is cleared once, before the first sign-in after the identity changes.
+const IDENTITY_MARKER_FILE: &str = "anisette_identity";
+
+/// The marker contents for the identity this build sends.
+fn current_identity() -> String {
+    format!("{}\n{}", AKD_CLIENT_INFO, AKD_USER_AGENT)
+}
+
+/// Clear saved anisette state once if it belongs to a different client identity. Never stops
+/// the sign-in: any error is logged and the sign-in goes ahead with whatever state exists.
+fn clear_anisette_if_identity_changed(app: &AppHandle) {
+    let data_dir = match app.path().app_data_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            warn!("Could not find the app data directory: {:?}", e);
+            return;
+        }
+    };
+    match clear_anisette_if_identity_changed_in(
+        &data_dir,
+        &current_identity(),
+        keyring_available(),
+        delete_keyring_anisette_state,
+    ) {
+        Ok(true) => debug!("Cleared anisette state saved under an older client identity."),
+        Ok(false) => {}
+        Err(e) => warn!("Could not check the saved sign-in identity: {:?}", e),
+    }
+}
+
+/// Returns whether saved anisette state was cleared. The marker is opened for writing BEFORE
+/// anything is cleared, so a marker that cannot be written never causes a clear (otherwise
+/// every sign-in would wipe freshly provisioned state). It is filled in only after the clear
+/// succeeds; if the clear fails it is left empty and the next sign-in tries again.
+fn clear_anisette_if_identity_changed_in(
+    data_dir: &Path,
+    identity: &str,
+    keyring_in_use: bool,
+    delete_keyring: impl FnOnce() -> Result<bool, keyring::Error>,
+) -> Result<bool, AppError> {
+    use std::io::Write;
+    let marker = data_dir.join(IDENTITY_MARKER_FILE);
+    let fs_err = |what: &str, e: std::io::Error| AppError::Filesystem(what.into(), e.to_string());
+    match std::fs::read(&marker) {
+        // Anything that is not exactly this identity (old identity, empty, not text) is a mismatch.
+        Ok(saved) if saved.trim_ascii() == identity.as_bytes() => return Ok(false),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // Unreadable marker: leave the state alone rather than risk clearing it on every sign-in.
+        Err(e) => return Err(fs_err("Failed to read the sign-in identity marker", e)),
+    }
+    std::fs::create_dir_all(data_dir)
+        .map_err(|e| fs_err("Failed to create the app data directory", e))?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&marker)
+        .map_err(|e| fs_err("Failed to open the sign-in identity marker", e))?;
+    let cleared = reset_anisette_state_in(data_dir, keyring_in_use, delete_keyring)?;
+    file.write_all(identity.as_bytes())
+        .map_err(|e| fs_err("Failed to write the sign-in identity marker", e))?;
+    Ok(cleared)
+}
+
 /// Set while a sign-in runs. Each sign-in asks Apple for a new trusted-device code, and a new
 /// code cancels the one before it, so a second sign-in started on top of the first (clicking
 /// Login again while "Logging in..." shows) makes the code the user types fail with -27589.
@@ -392,6 +460,8 @@ async fn login_inner(
     } else {
         anisette_server
     };
+
+    clear_anisette_if_identity_changed(app);
 
     let mut account = AppleAccount::builder(&email.to_lowercase())
         .anisette_provider(
@@ -770,6 +840,84 @@ mod tests {
         ));
         store_anisette_like_the_app(&dir);
         assert!(reset_anisette_state_in(&dir, true, failing).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Run the identity check with the keyring off.
+    fn check_identity(dir: &std::path::Path, identity: &str) -> bool {
+        clear_anisette_if_identity_changed_in(dir, identity, false, || Ok(false)).unwrap()
+    }
+
+    fn marker(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(dir.join(IDENTITY_MARKER_FILE)).unwrap()
+    }
+
+    #[test]
+    fn identity_change_clears_old_state_once() {
+        let dir = temp_dir("identity-change");
+        store_anisette_like_the_app(&dir);
+        // Upgrading from 2.3.3: state exists, no marker yet.
+        assert!(check_identity(&dir, "new-id"));
+        assert!(!dir.join(ANISETTE_STATE_KEY).exists());
+        assert_eq!(marker(&dir), "new-id");
+        // State provisioned again under the new identity is kept on later sign-ins.
+        store_anisette_like_the_app(&dir);
+        assert!(!check_identity(&dir, "new-id"));
+        assert!(dir.join(ANISETTE_STATE_KEY).exists());
+        // A later identity change clears it again.
+        assert!(check_identity(&dir, "newer-id"));
+        assert!(!dir.join(ANISETTE_STATE_KEY).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn identity_marker_on_a_fresh_install_just_records_the_identity() {
+        let dir = temp_dir("identity-fresh").join("not-created-yet");
+        assert!(!check_identity(&dir, "id"));
+        assert_eq!(marker(&dir), "id");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn identity_check_with_keyring_off_never_touches_the_keychain() {
+        let dir = temp_dir("identity-keyring-off");
+        store_anisette_like_the_app(&dir);
+        let touched = Cell::new(false);
+        clear_anisette_if_identity_changed_in(&dir, "id", false, || {
+            touched.set(true);
+            Ok(true)
+        })
+        .unwrap();
+        assert!(!touched.get());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn identity_marker_that_is_not_text_counts_as_a_mismatch() {
+        let dir = temp_dir("identity-binary");
+        store_anisette_like_the_app(&dir);
+        std::fs::write(dir.join(IDENTITY_MARKER_FILE), [0xff, 0xfe, 0x00]).unwrap();
+        assert!(check_identity(&dir, "id"));
+        assert_eq!(marker(&dir), "id");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_marker_that_cannot_be_written_never_clears_state() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("identity-readonly");
+        store_anisette_like_the_app(&dir);
+        let m = dir.join(IDENTITY_MARKER_FILE);
+        std::fs::write(&m, "old-id").unwrap();
+        std::fs::set_permissions(&m, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let result = clear_anisette_if_identity_changed_in(&dir, "new-id", false, || Ok(false));
+        assert!(result.is_err());
+        assert!(
+            dir.join(ANISETTE_STATE_KEY).exists(),
+            "state must survive an unwritable marker"
+        );
+        std::fs::set_permissions(&m, std::fs::Permissions::from_mode(0o644)).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

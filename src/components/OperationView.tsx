@@ -204,7 +204,7 @@ export default ({
                 components={{
                   discord: (
                     <span
-                      onClick={() => openUrl("https://discord.gg/EA6yVgydBz")}
+                      onClick={() => openUrl("https://discord.gg/gfHdsRXUVA")}
                       role="link"
                       className="error-link"
                     />
